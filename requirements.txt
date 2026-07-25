@@ -8,6 +8,8 @@ alembic>=1.13.0
 
 pydantic-settings>=2.0.0
 email-validator>=2.0.0
+# Required when running API on Python 3.9 (PEP604 unions in FastAPI signatures)
+eval_type_backport>=0.2.0
 
 # Auth
 python-jose[cryptography]>=3.3.0
@@ -30,6 +32,9 @@ azure-core>=1.30.0
 
 # Image processing — reference images for Sora 2 (must match video resolution)
 Pillow>=10.0.0
+
+# Email — Resend (same as OpsBrain-Backend)
+resend>=2.0.0
 
 # Tests
 pytest>=8.0.0

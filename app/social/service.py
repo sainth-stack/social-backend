@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, or_, select
@@ -185,9 +188,25 @@ class SocialMediaService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Account is disconnected — reconnect before syncing",
             )
-        token = decrypt(account.access_token_enc)
         handler = get_oauth_handler(account.platform)
-        stats = handler.sync_account_stats(account.platform_account_id, token)
+        token = decrypt(account.access_token_enc)
+
+        # Refresh expired / near-expiry tokens when a refresh_token is available (X, LinkedIn).
+        token = self._ensure_fresh_token(account, handler, token)
+
+        try:
+            stats = handler.sync_account_stats(account.platform_account_id, token)
+        except Exception as first_exc:
+            # One retry after forced refresh on auth failures.
+            refreshed = self._force_refresh_token(account, handler)
+            if not refreshed:
+                raise
+            token = refreshed
+            try:
+                stats = handler.sync_account_stats(account.platform_account_id, token)
+            except Exception:
+                raise first_exc from None
+
         if stats.get("account_name"):
             account.account_name = stats["account_name"]
         if stats.get("account_picture_url") is not None:
@@ -197,7 +216,59 @@ class SocialMediaService:
         account.last_synced_at = datetime.now(timezone.utc)
         self.db.commit()
         self.db.refresh(account)
+
+        # Keep analytics daily row in sync so Audience / Overview charts update.
+        try:
+            from app.social.analytics.sync import sync_account_daily
+
+            sync_account_daily(self.db, account)
+            self.db.commit()
+            self.db.refresh(account)
+        except Exception as exc:
+            logger.warning("Analytics daily sync after account sync failed: %s", exc)
+
         return self._serialize_account(account)
+
+    def _ensure_fresh_token(self, account: SocialAccount, handler, token: str) -> str:
+        expires = account.token_expires_at
+        if expires and expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        needs_refresh = bool(
+            expires and expires <= datetime.now(timezone.utc) + timedelta(minutes=5)
+        )
+        if not needs_refresh:
+            return token
+        refreshed = self._force_refresh_token(account, handler)
+        return refreshed or token
+
+    def _force_refresh_token(self, account: SocialAccount, handler) -> Optional[str]:
+        if not account.refresh_token_enc:
+            return None
+        try:
+            refresh = decrypt(account.refresh_token_enc)
+            payload = handler.refresh_access_token(refresh)
+            if not payload or not payload.get("access_token"):
+                return None
+            account.access_token_enc = encrypt(payload["access_token"])
+            if payload.get("refresh_token"):
+                account.refresh_token_enc = encrypt(str(payload["refresh_token"]))
+            expires_in = int(payload.get("expires_in") or 0)
+            if expires_in > 0:
+                account.token_expires_at = datetime.now(timezone.utc) + timedelta(
+                    seconds=expires_in
+                )
+            self.db.commit()
+            self.db.refresh(account)
+            logger.info("Refreshed OAuth token for %s account %s", account.platform.value, account.id)
+            return payload["access_token"]
+        except Exception as exc:
+            logger.warning(
+                "Token refresh failed for %s %s: %s",
+                account.platform.value,
+                account.id,
+                exc,
+            )
+            return None
 
     def get_oauth_url(
         self,

@@ -39,6 +39,8 @@ from app.social.schemas import (
     BulkRetryRequest,
     BulkRetryResponse,
     CalendarResponse,
+    ContentPlanGenerateRequest,
+    ContentPlanGenerateResponse,
     CreateSocialAccountRequest,
     CreateSocialPostRequest,
     GenerateImageRequest,
@@ -376,6 +378,19 @@ def calendar(
     _: User = Depends(get_current_user),
 ) -> CalendarResponse:
     return SocialMediaService(db).calendar(workspace, month)
+
+
+@router.post("/content-plan/generate", response_model=ContentPlanGenerateResponse)
+def generate_content_plan(
+    payload: ContentPlanGenerateRequest,
+    workspace: Workspace = Depends(require_workspace_access),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ContentPlanGenerateResponse:
+    """Generate day-wise posts, schedule them, and auto-publish via Celery at ETA."""
+    from app.social.content_plan import ContentPlanService
+
+    return ContentPlanService(db).generate(workspace, current_user, payload)
 
 
 # ── Analytics ─────────────────────────────────────────────────────────────────

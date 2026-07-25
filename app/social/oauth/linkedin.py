@@ -17,6 +17,8 @@ from app.social.oauth.base import OAuthAccountProfile, OAuthHandler, OAuthTokenR
 logger = logging.getLogger(__name__)
 
 # Always-safe member scopes (Share on LinkedIn + Sign In with LinkedIn).
+# Note: follower/connection counts need extra products (r_1st_connections_size /
+# Community Management). Without those, LinkedIn APIs return 403 — not a sync bug.
 LINKEDIN_MEMBER_SCOPES = [
     "openid",
     "profile",
@@ -88,6 +90,11 @@ class LinkedInOAuth(OAuthHandler):
         person_id = str(profile.get("sub") or profile.get("id") or "").strip()
         if person_id:
             person_urn = f"urn:li:person:{person_id}"
+            followers = self._member_followers(access_token)
+            if followers <= 0:
+                followers = self._network_size(access_token, person_urn)
+            if followers <= 0:
+                followers = self._connections_size(access_token, person_id)
             accounts.append(
                 OAuthAccountProfile(
                     platform_account_id=f"person:{person_id}",
@@ -96,7 +103,7 @@ class LinkedInOAuth(OAuthHandler):
                     or "LinkedIn Profile",
                     account_type=SocialAccountType.PROFILE,
                     account_picture_url=profile.get("picture"),
-                    follower_count=self._network_size(access_token, person_urn),
+                    follower_count=followers,
                     access_token=access_token,
                     refresh_token=refresh_token,
                     token_expires_at=token_expires_at,
@@ -105,19 +112,22 @@ class LinkedInOAuth(OAuthHandler):
 
         # 2) Company Pages the member administers
         for org in self._list_administered_organizations(access_token):
-            workspace_id = org["id"]
-            org_urn = f"urn:li:workspace:{workspace_id}"
+            org_id = org["id"]
+            org_urn = f"urn:li:organization:{org_id}"
+            followers = self._organization_followers(access_token, org_id)
+            if followers <= 0:
+                followers = self._network_size(
+                    access_token,
+                    org_urn,
+                    edge_type="CompanyFollowedByMember",
+                )
             accounts.append(
                 OAuthAccountProfile(
-                    platform_account_id=f"workspace:{workspace_id}",
-                    account_name=org.get("name") or f"LinkedIn Page {workspace_id}",
+                    platform_account_id=f"workspace:{org_id}",
+                    account_name=org.get("name") or f"LinkedIn Page {org_id}",
                     account_type=SocialAccountType.PAGE,
                     account_picture_url=org.get("picture"),
-                    follower_count=self._network_size(
-                        access_token,
-                        org_urn,
-                        edge_type="CompanyFollowedByMember",
-                    ),
+                    follower_count=followers,
                     access_token=access_token,
                     refresh_token=refresh_token,
                     token_expires_at=token_expires_at,
@@ -132,27 +142,64 @@ class LinkedInOAuth(OAuthHandler):
 
         return OAuthTokenResult(accounts=accounts)
 
+    def refresh_access_token(self, refresh_token: str) -> Optional[dict]:
+        self._require_credentials()
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    "https://www.linkedin.com/oauth/v2/accessToken",
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": self.client_id,
+                        "client_secret": self.client_secret,
+                    },
+                )
+                if response.status_code >= 400:
+                    logger.info("LinkedIn token refresh failed: %s", response.text[:200])
+                    return None
+                payload = response.json()
+                if not payload.get("access_token"):
+                    return None
+                return {
+                    "access_token": payload["access_token"],
+                    "refresh_token": payload.get("refresh_token") or refresh_token,
+                    "expires_in": int(payload.get("expires_in") or 5184000),
+                }
+        except httpx.HTTPError as exc:
+            logger.info("LinkedIn token refresh error: %s", exc)
+            return None
+
     def sync_account_stats(self, platform_account_id: str, access_token: str) -> dict:
         kind, entity_id = _split_account_id(platform_account_id)
         if kind == "workspace":
             org = self._get_organization(access_token, entity_id)
-            urn = f"urn:li:workspace:{entity_id}"
+            urn = f"urn:li:organization:{entity_id}"
+            followers = self._organization_followers(access_token, entity_id)
+            if followers <= 0:
+                followers = self._network_size(
+                    access_token, urn, edge_type="CompanyFollowedByMember"
+                )
             return {
                 "account_name": org.get("name") or f"LinkedIn Page {entity_id}",
                 "account_picture_url": org.get("picture"),
-                "follower_count": self._network_size(
-                    access_token, urn, edge_type="CompanyFollowedByMember"
-                ),
+                "follower_count": followers,
             }
 
         profile = self._get_profile(access_token)
         person_id = entity_id or str(profile.get("sub") or profile.get("id") or "")
         urn = f"urn:li:person:{person_id}" if person_id else ""
+        followers = self._member_followers(access_token)
+        if followers <= 0 and urn:
+            # Connections size is the best available signal without Marketing APIs.
+            followers = self._network_size(access_token, urn)
+        if followers <= 0 and person_id:
+            followers = self._connections_size(access_token, person_id)
         return {
             "account_name": profile.get("name")
             or f"{profile.get('given_name', '')} {profile.get('family_name', '')}".strip(),
             "account_picture_url": profile.get("picture"),
-            "follower_count": self._network_size(access_token, urn) if urn else 0,
+            "follower_count": followers,
         }
 
     # ── Internals ─────────────────────────────────────────────────────────────
@@ -318,15 +365,126 @@ class LinkedInOAuth(OAuthHandler):
                 )
                 if response.status_code >= 400:
                     logger.info(
-                        "LinkedIn networkSizes unavailable for %s (%s)",
+                        "LinkedIn networkSizes unavailable for %s (%s): %s",
                         urn,
                         response.status_code,
+                        response.text[:200],
                     )
                     return 0
                 data = response.json() or {}
-                return int(data.get("firstDegreeSize") or data.get("count") or 0)
+                return int(
+                    data.get("firstDegreeSize")
+                    or data.get("count")
+                    or data.get("followerCount")
+                    or 0
+                )
         except Exception as exc:
             logger.info("LinkedIn networkSizes failed for %s: %s", urn, exc)
+            return 0
+
+    def _member_followers(self, access_token: str) -> int:
+        """Lifetime member follower count (Marketing / Community Management apps)."""
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.get(
+                    "https://api.linkedin.com/rest/memberFollowersCount",
+                    headers={
+                        **self._auth_headers(access_token),
+                        "LinkedIn-Version": "202401",
+                    },
+                    params={"q": "me"},
+                )
+                if response.status_code >= 400:
+                    logger.info(
+                        "LinkedIn memberFollowersCount unavailable (%s)",
+                        response.status_code,
+                    )
+                    return 0
+                elements = list((response.json() or {}).get("elements") or [])
+                if not elements:
+                    return 0
+                return max(
+                    0,
+                    int(
+                        elements[0].get("memberFollowersCount")
+                        or elements[0].get("followerCount")
+                        or 0
+                    ),
+                )
+        except Exception as exc:
+            logger.info("LinkedIn memberFollowersCount failed: %s", exc)
+            return 0
+
+    def _organization_followers(self, access_token: str, organization_id: str) -> int:
+        """Company Page follower count when Community Management scopes are approved."""
+        urn = f"urn:li:organization:{organization_id}"
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.get(
+                    "https://api.linkedin.com/rest/organizationalEntityFollowerStatistics",
+                    headers={
+                        **self._auth_headers(access_token),
+                        "LinkedIn-Version": "202401",
+                    },
+                    params={
+                        "q": "organizationalEntity",
+                        "organizationalEntity": urn,
+                    },
+                )
+                if response.status_code >= 400:
+                    logger.info(
+                        "LinkedIn org follower stats unavailable (%s)",
+                        response.status_code,
+                    )
+                    return 0
+                elements = list((response.json() or {}).get("elements") or [])
+                if not elements:
+                    return 0
+                stats = elements[0]
+                # Prefer lifetime organic follower count when present.
+                for key in (
+                    "followerCountsByAssociationType",
+                    "followerCounts",
+                    "totalFollowerCount",
+                ):
+                    val = stats.get(key)
+                    if isinstance(val, int):
+                        return max(0, val)
+                    if isinstance(val, list) and val:
+                        organic = next(
+                            (
+                                x
+                                for x in val
+                                if (x.get("associationType") or "").upper()
+                                in ("ORGANIC", "MEMBER", "")
+                            ),
+                            val[0],
+                        )
+                        counts = organic.get("followerCounts") or organic
+                        total = counts.get("organicFollowerCount") or counts.get(
+                            "paidFollowerCount"
+                        )
+                        if total is not None:
+                            return max(0, int(total))
+                return 0
+        except Exception as exc:
+            logger.info("LinkedIn org followers failed: %s", exc)
+            return 0
+
+    def _connections_size(self, access_token: str, person_id: str) -> int:
+        """1st-degree connections (needs r_1st_connections_size when granted)."""
+        try:
+            urn = quote(f"urn:li:person:{person_id}", safe="")
+            with httpx.Client(timeout=30.0) as client:
+                response = client.get(
+                    f"https://api.linkedin.com/v2/connections/{urn}",
+                    headers=self._auth_headers(access_token),
+                )
+                if response.status_code >= 400:
+                    return 0
+                data = response.json() or {}
+                return max(0, int(data.get("firstDegreeSize") or 0))
+        except Exception:
             return 0
 
 

@@ -116,15 +116,49 @@ class XTwitterOAuth(OAuthHandler):
             ]
         )
 
+    def refresh_access_token(self, refresh_token: str) -> Optional[dict]:
+        """Exchange refresh_token for a new access token (OAuth 2.0)."""
+        self._require_credentials()
+        url = "https://api.twitter.com/2/oauth2/token"
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": self.client_id,
+        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        auth = (self.client_id, self.client_secret) if self.client_secret else None
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(url, data=data, headers=headers, auth=auth)
+                if response.status_code >= 400:
+                    logger.error("X token refresh failed: %s", response.text[:400])
+                    return None
+                payload = response.json()
+                if not payload.get("access_token"):
+                    return None
+                return {
+                    "access_token": payload["access_token"],
+                    "refresh_token": payload.get("refresh_token") or refresh_token,
+                    "expires_in": int(payload.get("expires_in") or 7200),
+                }
+        except httpx.HTTPError as exc:
+            logger.error("X token refresh request failed: %s", exc)
+            return None
+
     def sync_account_stats(self, platform_account_id: str, access_token: str) -> dict:
-        me = self._get_me(access_token)
-        user = me.get("data") or me
+        user = self._get_user(access_token, platform_account_id)
         username = user.get("username") or ""
         display_name = user.get("name") or username
+        metrics = user.get("public_metrics") or {}
+        followers = int(
+            metrics.get("followers_count")
+            or metrics.get("followers")
+            or 0
+        )
         return {
             "account_name": f"@{username}" if username else display_name,
             "account_picture_url": user.get("profile_image_url"),
-            "follower_count": int((user.get("public_metrics") or {}).get("followers_count") or 0),
+            "follower_count": max(0, followers),
         }
 
     def _exchange_code(self, code: str, code_verifier: str) -> dict[str, Any]:
@@ -153,15 +187,61 @@ class XTwitterOAuth(OAuthHandler):
             ) from exc
 
     def _get_me(self, access_token: str) -> dict[str, Any]:
-        url = "https://api.twitter.com/2/users/me"
-        params = {
-            "user.fields": "profile_image_url,public_metrics,username,name",
-        }
+        return self._x_get(
+            "https://api.twitter.com/2/users/me",
+            access_token,
+            {"user.fields": "profile_image_url,public_metrics,username,name"},
+        )
+
+    def _get_user(self, access_token: str, platform_account_id: str) -> dict[str, Any]:
+        """Prefer /users/:id (includes public_metrics), fall back to /users/me."""
+        user_id = (platform_account_id or "").strip()
+        if user_id:
+            try:
+                payload = self._x_get(
+                    f"https://api.twitter.com/2/users/{user_id}",
+                    access_token,
+                    {
+                        "user.fields": "profile_image_url,public_metrics,username,name",
+                    },
+                )
+                user = payload.get("data") or payload
+                if user.get("id") or user.get("username"):
+                    return user
+            except Exception as exc:
+                logger.info("X users/%s failed, falling back to me: %s", user_id, exc)
+        me = self._get_me(access_token)
+        return me.get("data") or me
+
+    def _x_get(
+        self,
+        url: str,
+        access_token: str,
+        params: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         with httpx.Client(timeout=30.0) as client:
             response = client.get(
                 url,
-                params=params,
+                params=params or {},
                 headers={"Authorization": f"Bearer {access_token}"},
             )
-            response.raise_for_status()
+            if response.status_code == 402:
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail=(
+                        "X API credits are depleted for this app. "
+                        "Follower sync needs available X API credits — wait for reset or upgrade the X developer plan."
+                    ),
+                )
+            if response.status_code == 401:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="X token expired — click Reconnect on the account card.",
+                )
+            if response.status_code >= 400:
+                logger.error("X API error %s: %s", response.status_code, response.text[:400])
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"X API error ({response.status_code})",
+                )
             return response.json()

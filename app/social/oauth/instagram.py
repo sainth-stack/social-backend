@@ -37,9 +37,9 @@ class InstagramOAuth(OAuthHandler):
         self.app_secret = settings.meta_instagram_app_secret or settings.meta_app_secret
         self.api_version = settings.meta_api_version
         # Instagram Business Login rejects http://localhost — use HTTPS tunnel/prod URL.
-        self.redirect_uri = (
-            settings.meta_instagram_redirect_uri
-            or settings.meta_social_redirect_uri.replace("{platform}", "instagram")
+        explicit = (settings.meta_instagram_redirect_uri or "").strip()
+        self.redirect_uri = explicit or settings.meta_social_redirect_uri.replace(
+            "{platform}", "instagram"
         )
 
     def _require_credentials(self) -> None:
@@ -50,6 +50,36 @@ class InstagramOAuth(OAuthHandler):
                     "Instagram OAuth is not configured. Set META_INSTAGRAM_APP_ID and "
                     "META_INSTAGRAM_APP_SECRET (from Meta → Instagram use case → "
                     "API setup with Instagram login) in the backend environment."
+                ),
+            )
+        uri = (self.redirect_uri or "").strip()
+        if not uri:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Set META_INSTAGRAM_REDIRECT_URI to an HTTPS callback "
+                    "(e.g. https://xxxx.ngrok-free.app/api/v1/social/oauth/instagram/callback) "
+                    "and add that exact URL in Meta → Valid OAuth Redirect URIs."
+                ),
+            )
+        lowered = uri.lower()
+        if lowered.startswith("http://localhost") or lowered.startswith("http://127.0.0.1"):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Instagram rejects http://localhost redirect URIs. "
+                    "Run `ngrok http 8001`, set META_INSTAGRAM_REDIRECT_URI to "
+                    "https://<subdomain>.ngrok-free.app/api/v1/social/oauth/instagram/callback, "
+                    "add the same URL in Meta Developer → Instagram → Valid OAuth Redirect URIs, "
+                    "then restart the backend."
+                ),
+            )
+        if not lowered.startswith("https://"):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "META_INSTAGRAM_REDIRECT_URI must be HTTPS. "
+                    f"Current value is invalid for Instagram Login: {uri}"
                 ),
             )
 

@@ -4,7 +4,7 @@ import uuid
 from datetime import date, datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from pydantic.alias_generators import to_camel
 
 CamelModel = ConfigDict(populate_by_name=True, alias_generator=to_camel)
@@ -151,6 +151,19 @@ class AdminUserSuspendRequest(BaseModel):
 
 class AdminUserPlanUpdateRequest(BaseModel):
     plan: str
+
+
+class AdminUserCreateRequest(BaseModel):
+    """POST /admin/users — create a user + owned workspace (no login token)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    full_name: Optional[str] = Field(default=None, max_length=160, alias="name")
+    workspace_name: Optional[str] = Field(default=None, max_length=160, alias="workspaceName")
+    plan: str = "starter"
+    is_platform_admin: bool = Field(default=False, alias="isPlatformAdmin")
 
 
 class PricingPlanLimits(BaseModel):

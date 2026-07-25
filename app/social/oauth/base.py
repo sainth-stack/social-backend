@@ -47,6 +47,10 @@ class OAuthHandler(ABC):
     ) -> dict:
         """Fetch latest follower count / picture for an account."""
 
+    def refresh_access_token(self, refresh_token: str) -> Optional[dict]:
+        """Refresh OAuth tokens. Return {access_token, refresh_token?, expires_in?} or None."""
+        return None
+
 
 def get_oauth_handler(platform: SocialPlatform | str) -> OAuthHandler:
     from app.social.oauth.facebook import FacebookOAuth

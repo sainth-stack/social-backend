@@ -1,21 +1,32 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.auth.deps import get_current_user
 from app.auth.schemas import (
+    ForgotPasswordRequest,
+    ForgotPasswordResponse,
     LoginRequest,
     MeResponse,
     RegisterRequest,
     RegisterResponse,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
     TokenResponse,
     UserOut,
     WorkspaceSummaryOut,
 )
-from app.auth.service import authenticate_user, issue_token_for_user, register_user
+from app.auth.service import (
+    authenticate_user,
+    issue_token_for_user,
+    register_user,
+    request_password_reset,
+    reset_password,
+)
 from app.core.database import get_db
+from app.core.rate_limit import enforce_rate_limit
 from app.users.models import User
 from app.workspaces.models import WorkspaceMember
 
@@ -23,7 +34,12 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/register", response_model=RegisterResponse, status_code=201)
-def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> RegisterResponse:
+def register(
+    payload: RegisterRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> RegisterResponse:
+    enforce_rate_limit(request, key_prefix="auth_register", limit=10, window_seconds=3600)
     user, workspace, membership = register_user(db, payload)
     token = issue_token_for_user(user)
     return RegisterResponse(
@@ -40,10 +56,37 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> Registe
 
 
 @router.post("/login", response_model=TokenResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
+def login(
+    payload: LoginRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> TokenResponse:
+    enforce_rate_limit(request, key_prefix="auth_login", limit=30, window_seconds=900)
     user = authenticate_user(db, payload)
     token = issue_token_for_user(user)
     return TokenResponse(access_token=token)
+
+
+@router.post("/forgot-password", response_model=ForgotPasswordResponse)
+def forgot_password(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> ForgotPasswordResponse:
+    enforce_rate_limit(request, key_prefix="auth_forgot", limit=10, window_seconds=3600)
+    request_password_reset(db, payload.email)
+    return ForgotPasswordResponse()
+
+
+@router.post("/reset-password", response_model=ResetPasswordResponse)
+def reset_password_endpoint(
+    payload: ResetPasswordRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> ResetPasswordResponse:
+    enforce_rate_limit(request, key_prefix="auth_reset", limit=20, window_seconds=3600)
+    reset_password(db, payload.token, payload.password)
+    return ResetPasswordResponse()
 
 
 @router.get("/me", response_model=MeResponse)

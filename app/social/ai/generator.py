@@ -522,23 +522,26 @@ def generate_carousel_content(
     cta_note = f"\nCall to action: {cta}." if cta else ""
 
     system_prompt = (
-        "You are an expert social media content strategist. "
+        "You are an elite social content strategist who designs carousels that "
+        "educate, build trust, and drive demos/signups/revenue. "
+        "Elevate short or vague briefs into premium, specific slides — no generic AI fluff. "
         "Return ONLY a JSON object with no extra text.\n"
         "Schema:\n"
-        '{"caption":"<intro caption with emojis, max 300 chars>",'
+        '{"caption":"<intro caption, max 300 chars>",'
         '"hashtags":["tag1","tag2"],'
         '"slides":[\n'
-        '  {"headline":"<bold 6-word max headline>","body":"<2-3 sentence supporting copy>","imagePrompt":"<vivid image generation prompt for DALL-E>"}\n'
+        '  {"headline":"<bold 6-word max headline>","body":"<2-3 sentence supporting copy>","imagePrompt":"<vivid premium image prompt>"}\n'
         "]}"
     )
     user_prompt = (
         f"Create a {num_slides}-slide LinkedIn/Instagram carousel about:\n{topic}\n"
         f"Tone: {tone}.{brand_note}{audience_note}{cta_note}\n"
         f"Rules:\n"
-        f"- Slide 1: hook/problem statement\n"
-        f"- Slides 2-{num_slides - 1}: one insight or step per slide\n"
-        f"- Last slide: strong CTA\n"
-        f"- imagePrompt: vivid, professional, photorealistic prompt for each slide image\n"
+        f"- Slide 1: scroll-stopping hook / painful problem\n"
+        f"- Slides 2-{num_slides - 1}: one concrete insight, tip, or step (specific, useful)\n"
+        f"- Last slide: clear revenue CTA (book demo, try, buy, comment)\n"
+        f"- Headlines must be punchy; body must sound human and expert\n"
+        f"- imagePrompt: cinematic, commercial, photorealistic, no text overlays\n"
         f"Return exactly {num_slides} slides."
     )
 
@@ -596,17 +599,19 @@ def generate_thread_content(
     cta_note = f"\nThread CTA (last tweet): {cta}." if cta else ""
 
     system_prompt = (
-        "You are a viral X/Twitter thread writer. "
-        "Return ONLY a JSON object.\n"
+        "You are a viral X/Twitter thread writer who turns thin ideas into "
+        "high-signal threads that get saves, follows, and conversions. "
+        "No empty hype. Return ONLY a JSON object.\n"
         'Schema: {"tweets":[{"text":"<tweet text, max 270 chars>"}],"hashtags":["tag1","tag2"]}'
     )
     user_prompt = (
         f"Write a {num_tweets}-tweet thread about:\n{topic}\n"
         f"Tone: {tone}.{brand_note}{audience_note}{cta_note}\n"
         "Rules:\n"
-        "- Tweet 1: arresting hook (question or bold stat)\n"
-        "- Middle tweets: one clear point each, numbered (2/, 3/ etc.)\n"
-        "- Last tweet: strong CTA or summary\n"
+        "- Tweet 1: arresting hook (specific pain, bold claim, or curiosity gap)\n"
+        "- Middle tweets: one clear, useful point each, numbered (2/, 3/ etc.)\n"
+        "- Last tweet: strong CTA that can generate revenue or leads\n"
+        "- Elevate a short brief into an impressive expert thread\n"
         f"- Each tweet MUST be under 270 characters\n"
         f"Return exactly {num_tweets} tweets."
     )
@@ -658,7 +663,8 @@ def generate_poll_content(
     audience_note = f"\nTarget audience: {audience}." if audience else ""
 
     system_prompt = (
-        "You are a social media engagement expert. "
+        "You are a social media engagement expert who designs polls that "
+        "surface buying intent and start revenue conversations. "
         "Return ONLY a JSON object.\n"
         'Schema: {"question":"<poll question, max 140 chars>","options":["<opt1>","<opt2>","<opt3>","<opt4>"],'
         '"caption":"<intro text to post above poll, max 300 chars>","hashtags":["tag1","tag2"]}'
@@ -667,9 +673,10 @@ def generate_poll_content(
         f"Create an engaging poll about:\n{topic}\n"
         f"Tone: {tone}.{brand_note}{audience_note}\n"
         "Rules:\n"
-        "- Question must spark debate or self-reflection\n"
+        "- Question must spark debate or reveal a buying preference\n"
         "- Options: mutually exclusive, no 'other' catch-all, max 25 chars each\n"
-        "- Caption: compelling reason to vote\n"
+        "- Caption: professional, benefit-led reason to vote + soft CTA\n"
+        "- Elevate a short brief into something impressive\n"
         "- Return exactly 4 options."
     )
 

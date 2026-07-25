@@ -1,9 +1,13 @@
-"""AI image generation for social posts using Azure OpenAI gpt-image-2.
+"""AI image generation via Azure AI Foundry / OpenAI gpt-image-2.
 
-Note: dall-e-3 was retired on March 4, 2026 and is no longer functional.
-gpt-image-2 is the GA replacement — it returns base64-encoded image data
-(b64_json) rather than URLs, so we decode and upload to Azure Blob directly.
-API requires api-version=preview (handled by get_image_client()).
+Uses the same client shape as Foundry samples::
+
+    client = OpenAI(base_url=\"...services.ai.azure.com/openai/v1\", api_key=...)
+    img = client.images.generate(model=\"gpt-image-2\", prompt=..., n=1, size=\"1024x1024\")
+    image_bytes = base64.b64decode(img.data[0].b64_json)
+
+``get_image_client()`` already selects the Foundry OpenAI client when
+``AZURE_OPENAI_ENDPOINT`` is a ``services.ai.azure.com`` URL.
 """
 
 from __future__ import annotations
@@ -24,17 +28,33 @@ ImageGenerationMode = Literal["create", "edit"]
 
 
 def _build_create_prompt(topic: str, style: Optional[str]) -> str:
+    """Elevate any brief into a scroll-stopping, commercial-quality social image."""
+    style_line = style or (
+        "premium modern brand photography / clean product-marketing aesthetic, "
+        "soft cinematic lighting, shallow depth of field when natural, "
+        "high contrast, polished color grade"
+    )
     return (
-        f"Create a clean, professional social media image about: {topic}. "
-        f"Style: {style or 'modern, minimal, brand-safe, no text overlays'}."
+        "Create a single, scroll-stopping social media marketing image. "
+        "It must look expensive, professional, and ready for Instagram/LinkedIn ads — "
+        "not clip-art, not generic stock, not cartoonish unless the brief demands it.\n"
+        f"Subject / brief (interpret creatively and elevate): {topic}\n"
+        f"Visual style: {style_line}\n"
+        "Composition: strong focal point, rule of thirds or bold centered hero, "
+        "negative space for optional future text, square-friendly framing.\n"
+        "Mood: trustworthy, aspirational, conversion-ready — makes the viewer want the product/service.\n"
+        "Strict: no watermarks, no logos unless described, no unreadable fake UI text, "
+        "no typography overlays, no garbled letters, no collage clutter."
     )
 
 
 def _build_edit_prompt(topic: str, style: Optional[str]) -> str:
     return (
-        f"Edit this social media image with the following change: {topic}. "
-        f"Keep the overall composition and brand-safe look. "
-        f"Style notes: {style or 'modern, minimal, professional'}."
+        "Edit this social media marketing image with a premium commercial finish.\n"
+        f"Requested change: {topic}\n"
+        "Keep composition coherent and brand-safe. "
+        f"Style notes: {style or 'modern, minimal, professional, high-end lighting'}.\n"
+        "No watermarks, no garbled text overlays."
     )
 
 
@@ -43,10 +63,12 @@ def _decode_image_result(result) -> dict[str, str | bytes]:
         raise RuntimeError("No image data returned from gpt-image-2")
 
     item = result.data[0]
-    if item.b64_json:
-        return {"imageB64": base64.b64decode(item.b64_json), "source": "ai_generated"}
-    if item.url:
-        return {"imageUrl": item.url, "source": "ai_generated"}
+    b64 = getattr(item, "b64_json", None)
+    if b64:
+        return {"imageB64": base64.b64decode(b64), "source": "ai_generated"}
+    url = getattr(item, "url", None)
+    if url:
+        return {"imageUrl": url, "source": "ai_generated"}
     raise RuntimeError("gpt-image-2 returned neither b64_json nor url")
 
 
@@ -63,6 +85,30 @@ def _download_source_image(url: str) -> bytes:
         ) from exc
 
 
+def _generate_create(client, *, model: str, prompt: str, size: str):
+    """Foundry-compatible create call (matches Azure sample)."""
+    # Primary: Foundry / OpenAI v1 style (returns b64_json by default).
+    try:
+        return client.images.generate(
+            model=model,
+            prompt=prompt,
+            n=1,
+            size=size,
+        )
+    except Exception as first_exc:
+        # Fallback for classic Azure OpenAI that still wants response_format.
+        try:
+            return client.images.generate(
+                model=model,
+                prompt=prompt,
+                n=1,
+                size=size,
+                response_format="b64_json",
+            )
+        except Exception:
+            raise first_exc from None
+
+
 def generate_post_image(
     *,
     topic: str,
@@ -71,7 +117,7 @@ def generate_post_image(
     mode: ImageGenerationMode = "create",
     source_image_bytes: Optional[bytes] = None,
 ) -> dict[str, str | bytes]:
-    """Generate or edit an image for a social post via Azure OpenAI gpt-image-2."""
+    """Generate or edit an image for a social post via gpt-image-2."""
     if not settings.azure_openai_api_key or not settings.azure_openai_endpoint:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -95,6 +141,8 @@ def generate_post_image(
             detail="Image generation is not available",
         ) from exc
 
+    model = settings.azure_openai_image_deployment  # gpt-image-2
+
     try:
         client = get_image_client()
 
@@ -102,24 +150,28 @@ def generate_post_image(
             prompt = _build_edit_prompt(topic, style)
             image_file = io.BytesIO(source_image_bytes)
             image_file.name = "source.png"
-            result = client.images.edit(
-                model=settings.azure_openai_image_deployment,
-                image=image_file,
-                prompt=prompt,
-                size=size,
-                n=1,
-                response_format="b64_json",
-            )
+            try:
+                result = client.images.edit(
+                    model=model,
+                    image=image_file,
+                    prompt=prompt,
+                    size=size,
+                    n=1,
+                )
+            except TypeError:
+                # Older SDK keyword set
+                image_file.seek(0)
+                result = client.images.edit(
+                    model=model,
+                    image=image_file,
+                    prompt=prompt,
+                    size=size,
+                    n=1,
+                    response_format="b64_json",
+                )
         else:
             prompt = _build_create_prompt(topic, style)
-            result = client.images.generate(
-                model=settings.azure_openai_image_deployment,
-                prompt=prompt,
-                size=size,
-                quality="medium",
-                n=1,
-                response_format="b64_json",
-            )
+            result = _generate_create(client, model=model, prompt=prompt, size=size)
 
         return _decode_image_result(result)
 
@@ -131,8 +183,9 @@ def generate_post_image(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                f"Image {action} failed. Ensure your Azure OpenAI resource has a "
-                "gpt-image-2 deployment and the api-version is set to 'preview'. "
+                f"Image {action} failed. Ensure AZURE_OPENAI_ENDPOINT points to "
+                "your Foundry resource (...services.ai.azure.com/openai/v1) and "
+                f"AZURE_OPENAI_IMAGE_DEPLOYMENT={model} exists. "
                 "You can also upload an image instead."
             ),
         ) from exc

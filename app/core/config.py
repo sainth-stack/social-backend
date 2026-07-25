@@ -80,7 +80,7 @@ class Settings(BaseSettings):
         default="2024-08-01-preview", validation_alias="AZURE_OPENAI_API_VERSION"
     )
     azure_openai_deployment: str = Field(
-        default="gpt-4o-mini", validation_alias="AZURE_OPENAI_DEPLOYMENT"
+        default="gpt-5.4-nano", validation_alias="AZURE_OPENAI_DEPLOYMENT"
     )
     # Image generation — gpt-image-2 requires api-version=preview
     azure_openai_image_deployment: str = Field(
@@ -150,6 +150,12 @@ class Settings(BaseSettings):
     x_redirect_uri: str = Field(
         default="http://localhost:8001/api/v1/social/oauth/x/callback",
         validation_alias="X_REDIRECT_URI",
+    )
+
+    # ── Email — Resend (shared with OpsBrain-Backend) ─────────────────────────
+    resend_api_key: Optional[str] = Field(default=None, validation_alias="RESEND_API_KEY")
+    resend_from_email: str = Field(
+        default="noreply@opsbrainai.com", validation_alias="RESEND_FROM_EMAIL"
     )
 
     # ── Misc ──────────────────────────────────────────────────────────────────

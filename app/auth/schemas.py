@@ -57,3 +57,20 @@ class RegisterResponse(BaseModel):
     token_type: str = "bearer"
     user: UserOut
     workspace: WorkspaceSummaryOut
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ForgotPasswordResponse(BaseModel):
+    detail: str = "If that email exists, a reset link has been sent."
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class ResetPasswordResponse(BaseModel):
+    detail: str = "Password updated. You can sign in with your new password."

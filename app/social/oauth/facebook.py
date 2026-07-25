@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlencode
 
 import httpx
@@ -21,6 +21,7 @@ FACEBOOK_SCOPES = [
     "pages_read_engagement",
     "pages_show_list",
     "pages_read_user_content",
+    "read_insights",
 ]
 
 
@@ -68,16 +69,20 @@ class FacebookOAuth(OAuthHandler):
         accounts: list[OAuthAccountProfile] = []
         for page in pages:
             page_token = page.get("access_token") or user_token
+            page_id = str(page["id"])
             picture = None
             if isinstance(page.get("picture"), dict):
                 picture = (page["picture"].get("data") or {}).get("url")
+            followers = self._extract_followers(page)
+            if followers <= 0:
+                followers = self._fetch_follower_count(page_id, page_token)
             accounts.append(
                 OAuthAccountProfile(
-                    platform_account_id=str(page["id"]),
+                    platform_account_id=page_id,
                     account_name=page.get("name") or "Facebook Page",
                     account_type=SocialAccountType.PAGE,
                     account_picture_url=picture,
-                    follower_count=int(page.get("followers_count") or page.get("fan_count") or 0),
+                    follower_count=followers,
                     access_token=page_token,
                     refresh_token=None,
                     token_expires_at=token_expires_at,
@@ -112,13 +117,64 @@ class FacebookOAuth(OAuthHandler):
         picture = None
         if isinstance(data.get("picture"), dict):
             picture = (data["picture"].get("data") or {}).get("url")
+        followers = self._extract_followers(data)
+        if followers <= 0:
+            followers = self._fetch_follower_count(platform_account_id, access_token)
         return {
             "account_name": data.get("name"),
             "account_picture_url": picture,
-            "follower_count": int(data.get("followers_count") or data.get("fan_count") or 0),
+            "follower_count": followers,
         }
 
     # ── Internals ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_followers(data: dict[str, Any]) -> int:
+        for key in ("followers_count", "fan_count", "follows_count"):
+            val = data.get(key)
+            if val is None:
+                continue
+            try:
+                return max(0, int(val))
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    def _fetch_follower_count(self, page_id: str, access_token: str) -> int:
+        """Fallback: Page insights when fan_count fields are missing (not when truly 0)."""
+        url = f"https://graph.facebook.com/{self.api_version}/{page_id}/insights"
+        for metric in ("page_fans", "page_follows"):
+            try:
+                with httpx.Client(timeout=30.0) as client:
+                    response = client.get(
+                        url,
+                        params={
+                            "metric": metric,
+                            "period": "day",
+                            "access_token": access_token,
+                        },
+                    )
+                    if response.status_code >= 400:
+                        continue
+                    payload = response.json() or {}
+                    rows = payload.get("data") or []
+                    if not rows:
+                        continue
+                    values = rows[0].get("values") or []
+                    if not values:
+                        continue
+                    raw = values[-1].get("value")
+                    if raw is None:
+                        continue
+                    return max(0, int(raw))
+            except Exception as exc:
+                logger.info(
+                    "Facebook insights %s unavailable for %s: %s",
+                    metric,
+                    page_id,
+                    exc,
+                )
+        return 0
 
     def _exchange_code_for_token(self, code: str) -> dict[str, Any]:
         url = f"https://graph.facebook.com/{self.api_version}/oauth/access_token"
@@ -145,6 +201,7 @@ class FacebookOAuth(OAuthHandler):
         params = {
             "fields": "id,name,access_token,picture.type(large),followers_count,fan_count",
             "access_token": user_token,
+            "limit": 100,
         }
         data = self._get_json(url, params)
         return list(data.get("data") or [])

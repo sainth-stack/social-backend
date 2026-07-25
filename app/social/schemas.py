@@ -373,6 +373,42 @@ class CalendarResponse(BaseModel):
     items: List[CalendarPostOut]
 
 
+class ContentPlanGenerateRequest(BaseModel):
+    days: int = Field(default=7, ge=1, le=30)
+    theme: Optional[str] = Field(default=None, max_length=500)
+    tone: Optional[str] = Field(default=None, max_length=64)
+    cta: Optional[str] = Field(default=None, max_length=200)
+    autoSchedule: bool = True
+    generateImages: bool = False
+
+
+class ContentPlanDayOut(BaseModel):
+    dayIndex: int
+    date: str
+    weekday: str
+    scheduledAt: Optional[str] = None
+    platform: SocialPlatform
+    topic: str = ""
+    title: str = ""
+    caption: str = ""
+    hashtags: List[str] = Field(default_factory=list)
+    imageUrl: Optional[str] = None
+    postId: Optional[str] = None
+    status: SocialPostStatus = SocialPostStatus.DRAFT
+
+
+class ContentPlanGenerateResponse(BaseModel):
+    days: int
+    timezone: str
+    autoScheduled: bool
+    scheduledCount: int = 0
+    draftCount: int = 0
+    items: List[ContentPlanDayOut] = Field(default_factory=list)
+    calendarItems: List[CalendarPostOut] = Field(default_factory=list)
+    errors: List[str] = Field(default_factory=list)
+    message: str = ""
+
+
 class BulkRetryRequest(BaseModel):
     postIds: List[str] = Field(min_length=1)
 

@@ -10,6 +10,7 @@ from app.admin import service
 from app.admin.schemas import (
     AdminAnalyticsOut,
     AdminOverviewOut,
+    AdminUserCreateRequest,
     AdminUserListItem,
     AdminUserListOut,
     AdminUserOut,
@@ -61,6 +62,19 @@ def list_admin_users(
 ) -> AdminUserListOut:
     return service.list_admin_users(
         db, search=search, plan=plan, status_filter=status, page=page, page_size=pageSize
+    )
+
+
+@router.post("/users", response_model=AdminUserListItem, status_code=201)
+def create_admin_user(payload: AdminUserCreateRequest, db: Session = Depends(get_db)) -> AdminUserListItem:
+    return service.create_admin_user(
+        db,
+        email=str(payload.email),
+        password=payload.password,
+        full_name=payload.full_name,
+        workspace_name=payload.workspace_name,
+        plan=payload.plan,
+        is_platform_admin=payload.is_platform_admin,
     )
 
 

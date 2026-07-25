@@ -72,6 +72,8 @@ def _container_name(bucket: str | None = None) -> str:
 class AzureBlobStorageProvider(ObjectStorageProvider):
     """Azure Blob Storage implementation of ObjectStorageProvider."""
 
+    _ensured_containers: set[str] = set()
+
     def build_key(self, workspace_id: str, document_id: str, extension: str) -> str:
         ext = extension.lstrip(".")
         prefix = settings.azure_storage_prefix.strip("/") or "social"
@@ -80,9 +82,37 @@ class AzureBlobStorageProvider(ObjectStorageProvider):
     def storage_bucket(self) -> str:
         return _container_name()
 
+    def _ensure_container(self, container: str) -> None:
+        """Create the blob container if missing (fixes ContainerNotFound on first upload)."""
+        if container in AzureBlobStorageProvider._ensured_containers:
+            return
+        service = _get_service_client()
+        cc = service.get_container_client(container)
+        try:
+            if not cc.exists():
+                logger.info("Creating Azure Blob container %s", container)
+                cc.create_container()
+        except Exception as exc:
+            # Race: another worker created it, or exists check failed — try create once.
+            try:
+                cc.create_container()
+            except Exception as create_exc:
+                # AlreadyExists is fine; anything else is logged and re-raised on upload.
+                msg = str(create_exc).lower()
+                if "containeralreadyexists" not in msg and "already exists" not in msg:
+                    logger.warning(
+                        "Could not ensure container %s: exists=%s create=%s",
+                        container,
+                        exc,
+                        create_exc,
+                    )
+                    return
+        AzureBlobStorageProvider._ensured_containers.add(container)
+
     def _container_client(self, bucket: str | None = None):
         service = _get_service_client()
         container = _container_name(bucket)
+        self._ensure_container(container)
         return service.get_container_client(container)
 
     def upload_bytes(
@@ -102,7 +132,18 @@ class AzureBlobStorageProvider(ObjectStorageProvider):
             if content_type:
                 from azure.storage.blob import ContentSettings
                 kwargs["content_settings"] = ContentSettings(content_type=content_type)
-            cc.upload_blob(name=key, data=data, **kwargs)
+            try:
+                cc.upload_blob(name=key, data=data, **kwargs)
+            except Exception as first_exc:
+                # Retry once after forcing container create (handles ContainerNotFound).
+                err = str(first_exc)
+                if "ContainerNotFound" in err or "ContainerNotFound" in type(first_exc).__name__:
+                    AzureBlobStorageProvider._ensured_containers.discard(_container_name(bucket))
+                    self._ensure_container(_container_name(bucket))
+                    cc = self._container_client(bucket)
+                    cc.upload_blob(name=key, data=data, **kwargs)
+                else:
+                    raise
         except Exception as exc:
             logger.exception("Azure Blob upload failed key=%s", key)
             raise HTTPException(

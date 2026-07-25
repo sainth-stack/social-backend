@@ -29,8 +29,9 @@ from app.social.models import (
     SocialPostPlatform,
     SocialPostStatus,
 )
+from app.core.security import hash_password
 from app.users.models import User
-from app.workspaces.models import Workspace, WorkspaceMember, WorkspacePlan
+from app.workspaces.models import SocialLevel, Workspace, WorkspaceMember, WorkspacePlan, WorkspaceRole
 
 # Estimated flat display prices used for MRR — Enterprise is custom/negotiated
 # and excluded from the estimate (contributes $0 by design, per spec).
@@ -430,6 +431,63 @@ def _admin_user_item_for(db: Session, user: User) -> AdminUserListItem:
         workspace.plan if workspace else None,
         membership.social_level if membership else None,
     )
+
+
+def create_admin_user(
+    db: Session,
+    *,
+    email: str,
+    password: str,
+    full_name: str | None = None,
+    workspace_name: str | None = None,
+    plan: str = "starter",
+    is_platform_admin: bool = False,
+) -> AdminUserListItem:
+    """Create a user with an owned workspace. Returns the admin list row (no JWT)."""
+    from app.auth.service import get_user_by_email
+
+    normalized_email = email.lower().strip()
+    if get_user_by_email(db, normalized_email):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+
+    try:
+        workspace_plan = WorkspacePlan(plan)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown plan: {plan}") from exc
+
+    user = User(
+        email=normalized_email,
+        password_hash=hash_password(password),
+        full_name=full_name.strip() if full_name else None,
+        is_active=True,
+        is_platform_admin=is_platform_admin,
+    )
+    db.add(user)
+    db.flush()
+
+    resolved_workspace_name = workspace_name or (
+        f"{full_name}'s Workspace" if full_name else f"{normalized_email.split('@')[0]}'s Workspace"
+    )
+    workspace = Workspace(
+        name=resolved_workspace_name,
+        plan=workspace_plan,
+        owner_user_id=user.id,
+        is_active=True,
+    )
+    db.add(workspace)
+    db.flush()
+
+    db.add(
+        WorkspaceMember(
+            user_id=user.id,
+            workspace_id=workspace.id,
+            role=WorkspaceRole.OWNER,
+            social_level=SocialLevel.ADMIN,
+        )
+    )
+    db.commit()
+    db.refresh(user)
+    return _admin_user_item_for(db, user)
 
 
 def set_admin_user_suspended(db: Session, user_id: uuid.UUID, suspended: bool | None) -> AdminUserListItem:

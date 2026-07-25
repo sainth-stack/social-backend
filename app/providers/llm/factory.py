@@ -1,80 +1,121 @@
 """
-LLM provider — Azure OpenAI for chat, image, and video generation.
+LLM provider — Azure OpenAI / Azure AI Foundry for chat, image, and video.
 
-This standalone social media backend only talks to Azure OpenAI (no AWS
-Bedrock hybrid client like the parent OpsBrain-Backend project). Every call
-site (`app/social/ai/*`) uses the OpenAI-compatible
-``client.chat.completions.create(...)`` shape, which ``AzureOpenAI`` already
-implements natively.
+Supports both endpoint styles:
+
+1) Azure AI Foundry (recommended for gpt-5.4-nano):
+   AZURE_OPENAI_ENDPOINT=https://<resource>.services.ai.azure.com/openai/v1
+   → uses OpenAI(base_url=..., api_key=...)
+
+2) Classic Azure OpenAI:
+   AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
+   → uses AzureOpenAI(azure_endpoint=..., api_version=..., api_key=...)
 
 Required env vars (chat):
   AZURE_OPENAI_API_KEY
-  AZURE_OPENAI_ENDPOINT        https://<resource>.openai.azure.com
-  AZURE_OPENAI_API_VERSION     (default: 2024-08-01-preview)
-  AZURE_OPENAI_DEPLOYMENT      chat deployment name (default: gpt-4o-mini)
-
-Image generation env vars:
-  AZURE_OPENAI_IMAGE_DEPLOYMENT    gpt-image-2 deployment name (default: gpt-image-2)
-  AZURE_OPENAI_IMAGE_API_VERSION   must be "preview" for gpt-image-2 (default: preview)
-
-Video generation env vars (Sora 2 — gated preview):
-  AZURE_OPENAI_VIDEO_DEPLOYMENT    sora-2 deployment name (default: sora-2)
-  AZURE_OPENAI_VIDEO_API_VERSION   must be "preview" (default: preview)
-  AZURE_OPENAI_VIDEO_ENDPOINT      optional; falls back to AZURE_OPENAI_ENDPOINT
+  AZURE_OPENAI_ENDPOINT
+  AZURE_OPENAI_DEPLOYMENT      e.g. gpt-5.4-nano
+  AZURE_OPENAI_API_VERSION     used only for classic AzureOpenAI clients
 """
 
 from __future__ import annotations
 
 import logging
 from functools import lru_cache
-from typing import Any
+from typing import Any, Union
 
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+LlmClient = Union[OpenAI, AzureOpenAI]
+
+
+def _is_foundry_endpoint(endpoint: str) -> bool:
+    e = endpoint.lower()
+    return "services.ai.azure.com" in e or e.rstrip("/").endswith("/openai/v1")
+
+
+def _foundry_base_url(endpoint: str) -> str:
+    """Ensure Foundry base_url ends with /openai/v1 (no trailing slash beyond that)."""
+    e = endpoint.strip().rstrip("/")
+    if e.endswith("/openai/v1"):
+        return e
+    if e.endswith("/openai"):
+        return f"{e}/v1"
+    return f"{e}/openai/v1"
+
+
+def _classic_azure_endpoint(endpoint: str) -> str:
+    """Strip /openai/v1 suffix for AzureOpenAI azure_endpoint."""
+    e = endpoint.strip().rstrip("/")
+    for suffix in ("/openai/v1", "/openai"):
+        if e.endswith(suffix):
+            return e[: -len(suffix)]
+    return e
+
+
+def _make_client(
+    *,
+    endpoint: str,
+    api_key: str,
+    api_version: str,
+) -> LlmClient:
+    if _is_foundry_endpoint(endpoint):
+        base_url = _foundry_base_url(endpoint)
+        logger.info("Using Azure AI Foundry OpenAI client base_url=%s", base_url)
+        return OpenAI(base_url=base_url, api_key=api_key)
+    azure_endpoint = _classic_azure_endpoint(endpoint)
+    logger.info(
+        "Using classic AzureOpenAI client endpoint=%s api_version=%s",
+        azure_endpoint,
+        api_version,
+    )
+    return AzureOpenAI(
+        api_key=api_key,
+        api_version=api_version,
+        azure_endpoint=azure_endpoint,
+    )
+
 
 @lru_cache(maxsize=1)
-def get_llm_client() -> AzureOpenAI:
-    """Return a process-wide singleton Azure OpenAI client for chat completions."""
+def get_llm_client() -> LlmClient:
+    """Return a process-wide singleton client for chat completions."""
     if not settings.azure_openai_api_key or not settings.azure_openai_endpoint:
         raise RuntimeError(
             "AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT are not configured."
         )
-    return AzureOpenAI(
+    return _make_client(
+        endpoint=settings.azure_openai_endpoint,
         api_key=settings.azure_openai_api_key,
         api_version=settings.azure_openai_api_version,
-        azure_endpoint=settings.azure_openai_endpoint,
     )
 
 
-def get_image_client() -> AzureOpenAI:
-    """Return an AzureOpenAI client configured for gpt-image-2 image generation.
+@lru_cache(maxsize=1)
+def get_image_client() -> LlmClient:
+    """Client for gpt-image-2 — Foundry OpenAI base_url when configured.
 
-    Uses api_version='preview' which is required for gpt-image-2.
+    Matches::
+        OpenAI(base_url=\"...services.ai.azure.com/openai/v1\", api_key=...)
+        client.images.generate(model=\"gpt-image-2\", ...)
     """
     if not settings.azure_openai_api_key:
         raise RuntimeError("AZURE_OPENAI_API_KEY is not configured.")
     if not settings.azure_openai_endpoint:
-        raise RuntimeError(
-            "AZURE_OPENAI_ENDPOINT is not configured. Set it to https://<your-resource>.openai.azure.com"
-        )
-
-    return AzureOpenAI(
+        raise RuntimeError("AZURE_OPENAI_ENDPOINT is not configured.")
+    return _make_client(
+        endpoint=settings.azure_openai_endpoint,
         api_key=settings.azure_openai_api_key,
+        # Foundry ignores api_version; classic Azure still uses image preview version.
         api_version=settings.azure_openai_image_api_version,
-        azure_endpoint=settings.azure_openai_endpoint,
     )
 
 
-def get_video_client() -> AzureOpenAI:
-    """Return an AzureOpenAI client configured for Sora 2 video generation.
-
-    Uses api_version='preview' and optionally a separate endpoint when Sora 2
-    is deployed on a different Azure OpenAI resource than the chat model.
-    """
+def get_video_client() -> LlmClient:
+    """Client for Sora 2 video generation."""
     if not settings.azure_openai_api_key:
         raise RuntimeError("AZURE_OPENAI_API_KEY is not configured.")
     endpoint = settings.azure_openai_video_endpoint or settings.azure_openai_endpoint
@@ -82,16 +123,15 @@ def get_video_client() -> AzureOpenAI:
         raise RuntimeError(
             "AZURE_OPENAI_ENDPOINT (or AZURE_OPENAI_VIDEO_ENDPOINT) is not configured."
         )
-
-    return AzureOpenAI(
+    return _make_client(
+        endpoint=endpoint,
         api_key=settings.azure_openai_video_api_key or settings.azure_openai_api_key,
         api_version=settings.azure_openai_video_api_version,
-        azure_endpoint=endpoint,
     )
 
 
 def get_llm_model() -> str:
-    """Return the Azure OpenAI chat deployment name."""
+    """Return the Azure OpenAI / Foundry chat deployment name."""
     return settings.azure_openai_deployment
 
 
