@@ -2,6 +2,9 @@
 //
 //   pm2 start scripts/pm2.ecosystem.config.cjs
 //
+// EC2 (sibling folder social-frontend): auto-detected, or:
+//   SOCIAL_MEDIA_FRONTEND=/home/ubuntu/social-frontend pm2 start scripts/pm2.ecosystem.config.cjs
+//
 // Local dev: ./scripts/ecosystem.sh up
 
 const fs = require("fs");
@@ -9,7 +12,23 @@ const path = require("path");
 
 const BACKEND = process.env.SOCIAL_MEDIA_ROOT || path.resolve(__dirname, "..");
 const REPO_ROOT = path.resolve(BACKEND, "..");
-const FRONTEND = path.join(REPO_ROOT, "frontend");
+
+function resolveFrontendRoot() {
+  if (process.env.SOCIAL_MEDIA_FRONTEND) {
+    return path.resolve(process.env.SOCIAL_MEDIA_FRONTEND);
+  }
+  const candidates = [
+    path.join(REPO_ROOT, "frontend"),
+    path.join(REPO_ROOT, "social-frontend"),
+  ];
+  for (const dir of candidates) {
+    const nextBin = path.join(dir, "node_modules/next/dist/bin/next");
+    if (fs.existsSync(nextBin)) return dir;
+  }
+  return candidates[0];
+}
+
+const FRONTEND = resolveFrontendRoot();
 
 function venvPython() {
   for (const name of [".venv", "venv"]) {
@@ -52,17 +71,25 @@ const pythonApp = (name, args, log) => ({
   error_file: path.join(LOGS, `${log}.log`),
 });
 
-const nextApp = (name, root, port) => ({
-  ...base,
-  name,
-  cwd: root,
-  script: path.join(root, "node_modules/next/dist/bin/next"),
-  args: `start -p ${port}`,
-  interpreter: "none",
-  env: { NODE_ENV: "production" },
-  out_file: path.join(LOGS, `${name}.log`),
-  error_file: path.join(LOGS, `${name}.log`),
-});
+const nextApp = (name, root, port) => {
+  const script = path.join(root, "node_modules/next/dist/bin/next");
+  if (!fs.existsSync(script)) {
+    throw new Error(
+      `Next.js not found at ${script}. Run: cd ${root} && npm ci && npm run build`,
+    );
+  }
+  return {
+    ...base,
+    name,
+    cwd: root,
+    script,
+    args: `start -p ${port}`,
+    interpreter: "none",
+    env: { NODE_ENV: "production" },
+    out_file: path.join(LOGS, `${name}.log`),
+    error_file: path.join(LOGS, `${name}.log`),
+  };
+};
 
 module.exports = {
   apps: [
