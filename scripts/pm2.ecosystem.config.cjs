@@ -1,11 +1,18 @@
-// pm2 — OpsBrain Social Media production
+// PM2 production — OpsBrain Social Media
 //
+// API :5000 | Frontend :5001 | Auto-detects ../social-frontend or ../frontend
+//
+// Start (from backend/):
 //   pm2 start scripts/pm2.ecosystem.config.cjs
+//   pm2 save
 //
-// EC2 (sibling folder social-frontend): auto-detected, or:
-//   SOCIAL_MEDIA_FRONTEND=/home/ubuntu/social-frontend pm2 start scripts/pm2.ecosystem.config.cjs
+// Stop / remove:
+//   ./scripts/pm2-stop.sh
 //
-// Local dev: ./scripts/ecosystem.sh up
+// Restart:
+//   ./scripts/pm2-stop.sh && pm2 start scripts/pm2.ecosystem.config.cjs && pm2 save
+//
+// Local dev (no PM2): ./scripts/ecosystem.sh up
 
 const fs = require("fs");
 const path = require("path");
@@ -18,12 +25,11 @@ function resolveFrontendRoot() {
     return path.resolve(process.env.SOCIAL_MEDIA_FRONTEND);
   }
   const candidates = [
-    path.join(REPO_ROOT, "frontend"),
     path.join(REPO_ROOT, "social-frontend"),
+    path.join(REPO_ROOT, "frontend"),
   ];
   for (const dir of candidates) {
-    const nextBin = path.join(dir, "node_modules/next/dist/bin/next");
-    if (fs.existsSync(nextBin)) return dir;
+    if (fs.existsSync(dir)) return dir;
   }
   return candidates[0];
 }
@@ -39,8 +45,8 @@ function venvPython() {
 }
 
 const PYTHON = venvPython();
-const PORT = process.env.PORT || "8000";
-const FRONTEND_PORT = process.env.FRONTEND_PORT || "3001";
+const PORT = process.env.PORT || "5000";
+const FRONTEND_PORT = process.env.FRONTEND_PORT || "5001";
 const API_WORKERS = process.env.API_WORKERS || "2";
 const WORKER_CONCURRENCY = process.env.CELERY_CONCURRENCY || "4";
 const LOGS = path.join(BACKEND, ".run");

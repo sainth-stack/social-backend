@@ -81,7 +81,32 @@ Enterprise-plan workspace) is created idempotently.
 
 Prefer `./scripts/ecosystem.sh up` (starts api + worker + beat together).
 
-Manual:
+### Production (EC2 + PM2)
+
+API on **5000**, frontend on **5001**. Frontend folder is auto-detected as
+`social-frontend` or `frontend` next to the backend repo.
+
+```bash
+cp .env.production .env
+./scripts/migrate.sh
+
+# frontend (sibling repo)
+cd ../social-frontend && npm ci && npm run build && cd ../social-backend
+
+mkdir -p .run
+pm2 start scripts/pm2.ecosystem.config.cjs
+pm2 save
+
+# stop / remove
+./scripts/pm2-stop.sh
+
+# restart
+./scripts/pm2-stop.sh && pm2 start scripts/pm2.ecosystem.config.cjs && pm2 save
+```
+
+Point nginx at `127.0.0.1:5000` (API) and `127.0.0.1:5001` (frontend).
+
+Manual Celery (without PM2):
 
 ```bash
 celery -A workers.celery_app:celery_app worker --loglevel=info -Q social_publish,social_analytics,social_maintenance
