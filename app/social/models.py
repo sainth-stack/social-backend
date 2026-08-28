@@ -178,6 +178,7 @@ class SocialBrandVoice(Base):
     )
     primary_language: Mapped[str] = mapped_column(String(16), nullable=False, default="en")
     system_prompt_override: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    logo_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

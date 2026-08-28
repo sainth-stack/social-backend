@@ -26,7 +26,8 @@ redis>=5.0.0
 # LLM + image/video generation — Azure OpenAI (gpt-4o-mini / gpt-image-2 / Sora 2)
 openai>=1.0.0
 
-# Object storage — Azure Blob Storage
+# Object storage — Amazon S3 (preferred) + Azure Blob fallback
+boto3>=1.34.0
 azure-storage-blob>=12.19.0
 azure-core>=1.30.0
 

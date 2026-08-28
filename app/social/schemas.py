@@ -204,6 +204,7 @@ class BrandVoiceOut(BaseModel):
     emojiUsage: EmojiUsage = EmojiUsage.SOMETIMES
     primaryLanguage: str = "en"
     systemPromptOverride: Optional[str] = None
+    logoUrl: Optional[str] = None
     updatedAt: Optional[str] = None
 
 
@@ -220,6 +221,11 @@ class BrandVoiceUpdateRequest(BaseModel):
     emojiUsage: EmojiUsage = EmojiUsage.SOMETIMES
     primaryLanguage: str = Field(default="en", max_length=16)
     systemPromptOverride: Optional[str] = None
+    logoUrl: Optional[str] = Field(default=None, max_length=2048)
+
+
+class UploadLogoResponse(BaseModel):
+    logoUrl: str
 
 
 class GeneratePostRequest(BaseModel):

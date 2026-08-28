@@ -69,6 +69,7 @@ from app.social.schemas import (
     SocialPostOut,
     UpdateSocialAccountRequest,
     UpdateSocialPostRequest,
+    UploadLogoResponse,
     UploadVideoResponse,
 )
 from app.social.service import SocialMediaService
@@ -605,6 +606,24 @@ def generate_image(
     )
 
 
+@router.post("/upload-logo", response_model=UploadLogoResponse)
+async def upload_logo(
+    workspace: Workspace = Depends(require_workspace_access),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+    file: UploadFile = File(...),
+) -> UploadLogoResponse:
+    """Upload workspace logo to S3/Azure; persists on brand voice profile."""
+    data = await file.read()
+    logo_url = SocialMediaService(db).upload_logo(
+        workspace,
+        data=data,
+        content_type=file.content_type or "image/png",
+        filename=file.filename,
+    )
+    return UploadLogoResponse(logoUrl=logo_url)
+
+
 @router.post("/upload-image", response_model=GenerateImageResponse)
 async def upload_image(
     workspace: Workspace = Depends(require_workspace_access),
@@ -612,7 +631,7 @@ async def upload_image(
     user: User = Depends(get_current_user),
     file: UploadFile = File(...),
 ) -> GenerateImageResponse:
-    """Upload a social post image to Azure Blob; returns a public HTTPS URL."""
+    """Upload a social post image to object storage; returns a public HTTPS URL."""
     data = await file.read()
     return SocialMediaService(db).upload_image(
         workspace,

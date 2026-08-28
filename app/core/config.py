@@ -129,6 +129,15 @@ class Settings(BaseSettings):
     )
     azure_storage_prefix: str = Field(default="social", validation_alias="AZURE_STORAGE_PREFIX")
 
+    # ── Object Storage — Amazon S3 (preferred when credentials are set) ─────────
+    aws_access_key_id: Optional[str] = Field(default=None, validation_alias="AWS_ACCESS_KEY_ID")
+    aws_secret_access_key: Optional[str] = Field(
+        default=None, validation_alias="AWS_SECRET_ACCESS_KEY"
+    )
+    aws_region: str = Field(default="ap-south-1", validation_alias="AWS_REGION")
+    aws_bucket_name: Optional[str] = Field(default=None, validation_alias="AWS_BUCKET_NAME")
+    aws_storage_prefix: str = Field(default="peers", validation_alias="AWS_STORAGE_PREFIX")
+
     # ── Meta (Facebook + Instagram) OAuth ─────────────────────────────────────
     meta_app_id: str = Field(default="", validation_alias="META_APP_ID")
     meta_app_secret: str = Field(default="", validation_alias="META_APP_SECRET")

@@ -1004,6 +1004,8 @@ class SocialMediaService:
         row.emoji_usage = payload.emojiUsage
         row.primary_language = payload.primaryLanguage
         row.system_prompt_override = payload.systemPromptOverride
+        if payload.logoUrl is not None:
+            row.logo_url = payload.logoUrl.strip() or None
         self.db.commit()
         self.db.refresh(row)
         return self._serialize_brand_voice(row)
@@ -1049,6 +1051,30 @@ class SocialMediaService:
 
         sample = generate_brand_voice_sample(brand_voice)
         return BrandVoiceTestResponse(**sample)
+
+    def upload_logo(
+        self,
+        workspace: Workspace,
+        *,
+        data: bytes,
+        content_type: str,
+        filename: Optional[str] = None,
+    ) -> str:
+        from app.social.media import upload_workspace_logo_bytes
+
+        upload = upload_workspace_logo_bytes(
+            workspace.id,
+            data,
+            content_type=content_type,
+            filename_hint=filename,
+        )
+        row = self._get_brand_voice_row(workspace.id)
+        if not row:
+            row = SocialBrandVoice(id=uuid.uuid4(), workspace_id=workspace.id)
+            self.db.add(row)
+        row.logo_url = upload.url
+        self.db.commit()
+        return upload.url
 
     def generate_post(
         self,
@@ -1513,6 +1539,7 @@ class SocialMediaService:
             "emoji_usage": row.emoji_usage.value if row.emoji_usage else "sometimes",
             "primary_language": row.primary_language,
             "system_prompt_override": row.system_prompt_override,
+            "logo_url": row.logo_url,
         }
 
     def _serialize_brand_voice(self, row: SocialBrandVoice) -> BrandVoiceOut:
@@ -1531,6 +1558,7 @@ class SocialMediaService:
             emojiUsage=row.emoji_usage,
             primaryLanguage=row.primary_language,
             systemPromptOverride=row.system_prompt_override,
+            logoUrl=row.logo_url,
             updatedAt=_iso(row.updated_at),
         )
 
