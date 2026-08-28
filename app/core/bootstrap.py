@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.core.database import SessionLocal
@@ -67,6 +68,10 @@ def seed_platform_admin() -> None:
         )
         db.commit()
         logger.info("Seeded platform admin user %s", email)
+    except IntegrityError:
+        db.rollback()
+        # Another uvicorn worker seeded the same admin concurrently.
+        logger.info("Platform admin %s already exists", email)
     except Exception:
         db.rollback()
         logger.exception("Failed to seed platform admin (non-fatal)")
