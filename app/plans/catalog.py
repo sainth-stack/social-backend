@@ -46,7 +46,7 @@ PLAN_CATALOG: dict[str, PlanDefinition] = {
         name="Free",
         monthly_price_usd=0.0,
         annual_price_usd=0.0,
-        description="Default plan for new workspaces.",
+        description="Default plan — includes brand voice, 2 accounts, and AI content basics.",
         limits=PlanLimits(
             connected_accounts=2,
             posts_per_month=10,
@@ -54,7 +54,7 @@ PLAN_CATALOG: dict[str, PlanDefinition] = {
             ai_images_per_month=5,
             ai_videos_per_month=0,
             templates=3,
-            brand_voice=False,
+            brand_voice=True,
             approval_workflow=False,
         ),
     ),
@@ -63,7 +63,7 @@ PLAN_CATALOG: dict[str, PlanDefinition] = {
         name="Pro",
         monthly_price_usd=99.0,
         annual_price_usd=990.0,
-        description="Pro plan for teams that need more posts, brand voice, and multi-version AI.",
+        description="Pro plan for teams that need more posts, approval workflow, and multi-version AI.",
         limits=PlanLimits(
             connected_accounts=10,
             posts_per_month=100,

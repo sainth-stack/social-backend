@@ -988,9 +988,6 @@ class SocialMediaService:
         workspace: Workspace,
         payload: BrandVoiceUpdateRequest,
     ) -> BrandVoiceOut:
-        from app.social.limits import enforce_brand_voice_available
-
-        enforce_brand_voice_available(self.db, workspace)
         row = self._get_brand_voice_row(workspace.id)
         if not row:
             row = SocialBrandVoice(id=uuid.uuid4(), workspace_id=workspace.id)

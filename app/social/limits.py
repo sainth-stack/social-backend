@@ -108,18 +108,6 @@ def enforce_approval_available(db: Session, workspace: Workspace) -> None:
         )
 
 
-def enforce_brand_voice_available(db: Session, workspace: Workspace) -> None:
-    plan = get_limits(db, workspace)
-    if not plan.limits.brand_voice:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={
-                "code": "PLAN_LIMIT_BRAND_VOICE",
-                "message": "Brand voice requires the Growth plan or higher.",
-            },
-        )
-
-
 # ── AI generation quotas (text / image / video) — enforced separately ──────
 
 def _enforce_ai_limit(db: Session, workspace: Workspace, kind: str, limit: int, plan_name: str) -> None:
