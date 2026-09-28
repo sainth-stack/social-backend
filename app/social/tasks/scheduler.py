@@ -6,7 +6,6 @@ import logging
 from datetime import datetime, timezone
 
 from app.core.database import get_database
-from app.core.mongo_utils import utcnow
 from app.social.models import SocialPostStatus
 from workers.celery_app import celery_app
 
@@ -33,10 +32,6 @@ def enqueue_due_social_posts() -> dict:
         )
     )
     for post in due:
-        db["social_posts"].update_one(
-            {"id": post["id"]},
-            {"$set": {"status": SocialPostStatus.PUBLISHING.value, "updated_at": utcnow()}},
-        )
         publish_post.delay(str(post["id"]))
         enqueued += 1
         logger.info("Enqueued due social post %s", post["id"])

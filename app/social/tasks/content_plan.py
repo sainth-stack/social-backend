@@ -8,7 +8,6 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.core.database import get_database
-from app.social.content_plan import ContentPlanService
 from app.social.schemas import ContentPlanGenerateRequest
 from app.social.tasks.task_errors import format_task_exception
 from workers.celery_app import celery_app
@@ -30,6 +29,12 @@ def generate_content_plan_task(
 ) -> dict:
     db = get_database()
 
+    from app.social.content_plan import (
+        ContentPlanService,
+        _accounts_for_plan,
+        estimate_plan_work_steps,
+    )
+
     workspace = db["workspaces"].find_one({"id": str(workspace_id)})
     user = db["users"].find_one({"id": str(user_id)})
     if not workspace or not user:
@@ -41,7 +46,11 @@ def generate_content_plan_task(
         msg = format_task_exception(exc)
         logger.error("content plan payload invalid workspace=%s: %s", workspace_id, msg)
         return {"error": msg}
-    total = min(int(request.days), 30)
+
+    plan_accounts = _accounts_for_plan(db, str(workspace_id), request.platforms)
+    total = estimate_plan_work_steps(
+        workspace=workspace, payload=request, accounts=plan_accounts
+    )
 
     def progress(current: int, total_days: int, message: str) -> None:
         self.update_state(

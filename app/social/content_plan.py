@@ -295,6 +295,55 @@ def _accounts_for_plan(
     return filtered
 
 
+PLAN_PLATFORM_ORDER = (
+    SocialPlatform.FACEBOOK,
+    SocialPlatform.INSTAGRAM,
+    SocialPlatform.LINKEDIN,
+)
+
+
+def _plan_platform_targets(
+    accounts: list[dict],
+    platforms: Optional[list[SocialPlatform]],
+) -> list[tuple[SocialPlatform, dict]]:
+    """One account per selected platform — each plan day posts to every selected platform."""
+    by_platform: dict[str, list[dict]] = {}
+    for account in accounts:
+        key = str(account.get("platform") or "")
+        by_platform.setdefault(key, []).append(account)
+
+    if platforms:
+        selected: list[tuple[SocialPlatform, dict]] = []
+        for p in platforms:
+            val = p.value if hasattr(p, "value") else str(p)
+            accs = by_platform.get(val) or []
+            if accs:
+                selected.append((SocialPlatform(val), accs[0]))
+        return selected
+
+    out: list[tuple[SocialPlatform, dict]] = []
+    for p in PLAN_PLATFORM_ORDER:
+        accs = by_platform.get(p.value) or []
+        if accs:
+            out.append((p, accs[0]))
+    return out
+
+
+def estimate_plan_work_steps(
+    *,
+    workspace: dict,
+    payload: ContentPlanGenerateRequest,
+    accounts: list[dict],
+) -> int:
+    targets = _plan_platform_targets(accounts, payload.platforms)
+    if not targets:
+        return 1
+    if getattr(payload, "targetDate", None):
+        return len(targets)
+    days = min(int(payload.days), _plan_cap(workspace))
+    return max(1, days * len(targets))
+
+
 def _occupied_plan_dates(db: Database, workspace_id: str, tz_name: str) -> set[str]:
     tz = _tz(tz_name)
     posts = list(
@@ -476,6 +525,16 @@ class ContentPlanService:
             else set()
         )
 
+        platform_targets = _plan_platform_targets(accounts, payload.platforms)
+        if not platform_targets:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No connected accounts match the selected platforms.",
+            )
+        queue_gap = max(15, int(settings.get("queueGapMinutes") or 30))
+        total_steps = len(slots) * len(platform_targets)
+        work_step = 0
+
         day_outs: list[ContentPlanDayOut] = []
         calendar_items: list[CalendarPostOut] = []
         scheduled_count = 0
@@ -483,208 +542,227 @@ class ContentPlanService:
         skipped_count = 0
         errors: list[str] = []
         stopped_by_user = False
+        stop_plan = False
 
-        for i, slot in enumerate(slots):
+        for i, base_slot in enumerate(slots):
             if cancel_check and cancel_check():
                 stopped_by_user = True
                 errors.append("Stopped by user — partial plan saved.")
                 break
 
-            local_slot = slot.astimezone(_tz(tz_name))
-            slot_date = local_slot.date().isoformat()
-
-            if progress_callback:
-                progress_callback(
-                    i, len(slots), f"Day {i + 1} of {len(slots)} — {local_slot.strftime('%a %b %d')}"
-                )
+            local_base = base_slot.astimezone(_tz(tz_name))
+            slot_date = local_base.date().isoformat()
+            day_label = f"Day {i + 1}"
+            day_focus = DAY_FOCUS_ANGLES[i % len(DAY_FOCUS_ANGLES)]
 
             if payload.skipFilledDays and slot_date in occupied_dates:
                 skipped_count += 1
-                errors.append(f"Day {i + 1} ({slot_date}): skipped — already has a post")
+                work_step += len(platform_targets)
+                errors.append(f"{day_label} ({slot_date}): skipped — already has a post")
                 continue
 
-            account = accounts[i % len(accounts)]
-            platform = SocialPlatform(account["platform"])
-            day_focus = DAY_FOCUS_ANGLES[i % len(DAY_FOCUS_ANGLES)]
-            topic = build_plan_day_topic(
-                user_prompt=user_prompt,
-                brand_name=brand_name,
-                brand=brand,
-                platform=platform,
-                day_index=i + 1,
-                total_days=len(slots),
-                audience=audience,
-                day_focus=day_focus,
-                tone=tone,
-                cta=cta,
-            )
+            for p_idx, (platform, account) in enumerate(platform_targets):
+                if cancel_check and cancel_check():
+                    stopped_by_user = True
+                    errors.append("Stopped by user — partial plan saved.")
+                    stop_plan = True
+                    break
 
-            try:
-                enforce_posts_limit(self.db, workspace)
-                enforce_ai_text_limit(self.db, workspace)
-            except HTTPException as exc:
-                errors.append(f"Day {i + 1}: {exc.detail}")
+                work_step += 1
+                slot = base_slot + timedelta(minutes=p_idx * queue_gap)
+                local_slot = slot.astimezone(_tz(tz_name))
+                platform_label = platform.value
+
+                if progress_callback:
+                    progress_callback(
+                        work_step,
+                        total_steps,
+                        f"{day_label} · {platform_label} — {local_slot.strftime('%a %b %d')}",
+                    )
+
+                topic = build_plan_day_topic(
+                    user_prompt=user_prompt,
+                    brand_name=brand_name,
+                    brand=brand,
+                    platform=platform,
+                    day_index=i + 1,
+                    total_days=len(slots),
+                    audience=audience,
+                    day_focus=day_focus,
+                    tone=tone,
+                    cta=cta,
+                )
+
+                try:
+                    enforce_posts_limit(self.db, workspace)
+                    enforce_ai_text_limit(self.db, workspace)
+                except HTTPException as exc:
+                    errors.append(f"{day_label} ({platform_label}): {exc.detail}")
+                    stop_plan = True
+                    break
+
+                try:
+                    record_ai_usage(self.db, workspace["id"], "text", user_id=user["id"])
+                    result = generate_platform_content(
+                        topic=topic,
+                        tone=tone,
+                        platforms=[platform.value],
+                        audience=audience,
+                        cta=cta,
+                        include_hashtags=True,
+                        include_comment=False,
+                        brand_voice=brand,
+                        content_series_mode=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Plan %s %s caption failed: %s", day_label, platform_label, exc)
+                    errors.append(f"{day_label} ({platform_label}): caption generation failed")
+                    continue
+
+                pc = result.get(platform.value) or {}
+                caption = (pc.get("caption") or "").strip()
+                hashtags = list(pc.get("hashtags") or [])
+                if not caption:
+                    errors.append(f"{day_label} ({platform_label}): empty caption")
+                    continue
+
+                image_url: Optional[str] = None
+                image_source = SocialImageSource.NONE
+                need_image = platform == SocialPlatform.INSTAGRAM or payload.generateImages
+                if need_image:
+                    try:
+                        enforce_ai_image_limit(self.db, workspace)
+                        record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"])
+                        img_data = generate_post_image(
+                            topic=build_plan_image_brief(
+                                caption=caption,
+                                brand_name=brand_name,
+                                platform=platform,
+                                day_focus=day_focus,
+                                user_prompt=user_prompt,
+                            ),
+                            style=image_style,
+                            size="1024x1024",
+                            mode="create",
+                        )
+                        upload: Optional[SocialBlobUpload] = None
+                        if img_data.get("imageB64"):
+                            upload = upload_social_image_bytes(
+                                workspace["id"],
+                                img_data["imageB64"],
+                                content_type="image/png",
+                            )
+                        if upload:
+                            social._record_media_asset(
+                                workspace,
+                                user,
+                                media_type=SocialMediaAssetType.IMAGE,
+                                source=SocialImageSource.AI_GENERATED,
+                                blob_key=upload.blob_key,
+                                blob_url=upload.url,
+                                mime_type=upload.content_type,
+                                file_size_bytes=upload.file_size,
+                                prompt=topic,
+                            )
+                            image_url = upload.url
+                            image_source = SocialImageSource.AI_GENERATED
+                    except Exception as exc:
+                        logger.warning("Plan %s %s image failed: %s", day_label, platform_label, exc)
+                        if platform == SocialPlatform.INSTAGRAM:
+                            errors.append(f"{day_label} ({platform_label}): Instagram needs an image — skipped")
+                            continue
+
+                title = f"{day_label} ({platform_label}): {caption[:50]}"
+
+                try:
+                    created = social.create_post(
+                        workspace,
+                        user,
+                        CreateSocialPostRequest(
+                            title=title,
+                            status=SocialPostStatus.DRAFT,
+                            imageUrl=image_url,
+                            imageSource=image_source,
+                            aiPrompt=user_prompt,
+                            platforms=[
+                                SocialPostPlatformIn(
+                                    platform=platform,
+                                    socialAccountId=str(account["id"]),
+                                    caption=caption,
+                                    hashtags=hashtags,
+                                )
+                            ],
+                        ),
+                    )
+                    post_id = created.id
+                    final_status = SocialPostStatus.DRAFT
+                    scheduled_at_iso: Optional[str] = None
+
+                    if payload.autoSchedule:
+                        try:
+                            post = self._load_post(post_id)
+                            scheduled = social.schedule_post(
+                                post, SchedulePostRequest(scheduledAt=slot.isoformat())
+                            )
+                            final_status = scheduled.status
+                            scheduled_at_iso = scheduled.scheduledAt
+                            scheduled_count += 1
+                        except Exception as exc:
+                            logger.warning("Plan %s %s schedule failed: %s", day_label, platform_label, exc)
+                            try:
+                                self.db["social_posts"].update_one(
+                                    {"id": post_id}, {"$set": {"scheduled_at": slot}}
+                                )
+                                scheduled_at_iso = slot.isoformat()
+                            except Exception:
+                                scheduled_at_iso = slot.isoformat()
+                            errors.append(f"{day_label} ({platform_label}): saved as draft (schedule failed)")
+                            draft_count += 1
+                    else:
+                        draft_count += 1
+
+                    day_outs.append(
+                        ContentPlanDayOut(
+                            dayIndex=i + 1,
+                            date=local_slot.date().isoformat(),
+                            weekday=local_slot.strftime("%a"),
+                            scheduledAt=scheduled_at_iso or slot.isoformat(),
+                            platform=platform,
+                            topic=day_focus,
+                            title=title,
+                            caption=caption,
+                            hashtags=hashtags,
+                            imageUrl=image_url,
+                            postId=post_id,
+                            status=final_status,
+                        )
+                    )
+                    calendar_items.append(
+                        CalendarPostOut(
+                            id=post_id,
+                            title=title,
+                            status=final_status,
+                            scheduledAt=scheduled_at_iso or slot.isoformat(),
+                            publishedAt=None,
+                            platforms=[platform],
+                            captionPreview=caption[:80],
+                            imageUrl=image_url,
+                        )
+                    )
+                except Exception:
+                    logger.exception("Plan %s %s create failed", day_label, platform_label)
+                    errors.append(f"{day_label} ({platform_label}): could not create post")
+
+            occupied_dates.add(slot_date)
+            if stop_plan:
                 break
 
-            try:
-                record_ai_usage(self.db, workspace["id"], "text", user_id=user["id"])
-                result = generate_platform_content(
-                    topic=topic,
-                    tone=tone,
-                    platforms=[platform.value],
-                    audience=audience,
-                    cta=cta,
-                    include_hashtags=True,
-                    include_comment=False,
-                    brand_voice=brand,
-                    content_series_mode=True,
-                )
-            except Exception as exc:
-                logger.warning("Plan day %s caption failed: %s", i + 1, exc)
-                errors.append(f"Day {i + 1}: caption generation failed")
-                continue
-
-            pc = result.get(platform.value) or {}
-            caption = (pc.get("caption") or "").strip()
-            hashtags = list(pc.get("hashtags") or [])
-            if not caption:
-                errors.append(f"Day {i + 1}: empty caption")
-                continue
-
-            image_url: Optional[str] = None
-            image_source = SocialImageSource.NONE
-            need_image = platform == SocialPlatform.INSTAGRAM or payload.generateImages
-            if need_image:
-                try:
-                    enforce_ai_image_limit(self.db, workspace)
-                    record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"])
-                    img_data = generate_post_image(
-                        topic=build_plan_image_brief(
-                            caption=caption,
-                            brand_name=brand_name,
-                            platform=platform,
-                            day_focus=day_focus,
-                            user_prompt=user_prompt,
-                        ),
-                        style=image_style,
-                        size="1024x1024",
-                        mode="create",
-                    )
-                    upload: Optional[SocialBlobUpload] = None
-                    if img_data.get("imageB64"):
-                        upload = upload_social_image_bytes(
-                            workspace["id"],
-                            img_data["imageB64"],
-                            content_type="image/png",
-                        )
-                    if upload:
-                        social._record_media_asset(
-                            workspace,
-                            user,
-                            media_type=SocialMediaAssetType.IMAGE,
-                            source=SocialImageSource.AI_GENERATED,
-                            blob_key=upload.blob_key,
-                            blob_url=upload.url,
-                            mime_type=upload.content_type,
-                            file_size_bytes=upload.file_size,
-                            prompt=topic,
-                        )
-                        image_url = upload.url
-                        image_source = SocialImageSource.AI_GENERATED
-                except Exception as exc:
-                    logger.warning("Plan day %s image failed: %s", i + 1, exc)
-                    if platform == SocialPlatform.INSTAGRAM:
-                        errors.append(f"Day {i + 1}: Instagram needs an image — skipped")
-                        continue
-
-            title = f"Day {i + 1}: {caption[:60]}"
-
-            try:
-                created = social.create_post(
-                    workspace,
-                    user,
-                    CreateSocialPostRequest(
-                        title=title,
-                        status=SocialPostStatus.DRAFT,
-                        imageUrl=image_url,
-                        imageSource=image_source,
-                        aiPrompt=user_prompt,
-                        platforms=[
-                            SocialPostPlatformIn(
-                                platform=platform,
-                                socialAccountId=str(account["id"]),
-                                caption=caption,
-                                hashtags=hashtags,
-                            )
-                        ],
-                    ),
-                )
-                post_id = created.id
-                final_status = SocialPostStatus.DRAFT
-                scheduled_at_iso: Optional[str] = None
-
-                if payload.autoSchedule:
-                    try:
-                        post = self._load_post(post_id)
-                        scheduled = social.schedule_post(
-                            post, SchedulePostRequest(scheduledAt=slot.isoformat())
-                        )
-                        final_status = scheduled.status
-                        scheduled_at_iso = scheduled.scheduledAt
-                        scheduled_count += 1
-                    except Exception as exc:
-                        logger.warning("Plan day %s schedule failed: %s", i + 1, exc)
-                        try:
-                            self.db["social_posts"].update_one(
-                                {"id": post_id}, {"$set": {"scheduled_at": slot}}
-                            )
-                            scheduled_at_iso = slot.isoformat()
-                        except Exception:
-                            scheduled_at_iso = slot.isoformat()
-                        errors.append(f"Day {i + 1}: saved as draft (schedule failed)")
-                        draft_count += 1
-                else:
-                    draft_count += 1
-
-                day_outs.append(
-                    ContentPlanDayOut(
-                        dayIndex=i + 1,
-                        date=local_slot.date().isoformat(),
-                        weekday=local_slot.strftime("%a"),
-                        scheduledAt=scheduled_at_iso or slot.isoformat(),
-                        platform=platform,
-                        topic=day_focus,
-                        title=title,
-                        caption=caption,
-                        hashtags=hashtags,
-                        imageUrl=image_url,
-                        postId=post_id,
-                        status=final_status,
-                    )
-                )
-                calendar_items.append(
-                    CalendarPostOut(
-                        id=post_id,
-                        title=title,
-                        status=final_status,
-                        scheduledAt=scheduled_at_iso or slot.isoformat(),
-                        publishedAt=None,
-                        platforms=[platform],
-                        captionPreview=caption[:80],
-                        imageUrl=image_url,
-                    )
-                )
-                occupied_dates.add(slot_date)
-            except Exception as exc:
-                logger.exception("Plan day %s create failed", i + 1)
-                errors.append(f"Day {i + 1}: could not create post")
-
         if progress_callback:
-            progress_callback(len(slots), len(slots), "Content plan complete")
+            progress_callback(total_steps, total_steps, "Content plan complete")
 
         skip_note = f", {skipped_count} skipped" if skipped_count else ""
         base_message = (
-            f"Planned {len(day_outs)} day(s)"
+            f"Planned {len(day_outs)} post(s)"
             + (f", {scheduled_count} set to auto-post" if scheduled_count else "")
             + skip_note
             + ("." if not errors else f" · {len(errors)} note(s).")

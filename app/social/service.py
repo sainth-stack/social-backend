@@ -744,17 +744,24 @@ class SocialMediaService:
     def publish_now(self, post: dict) -> SocialPostOut:
         platforms = _get_post_platforms(self.db, post["id"])
         self._validate_ready_to_publish_dict(post, platforms)
-        if post.get("status") in (SocialPostStatus.PUBLISHING.value, SocialPostStatus.PUBLISHED.value):
+        if post.get("status") == SocialPostStatus.PUBLISHED.value:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Post is already {post.get('status')}",
             )
+        if post.get("status") == SocialPostStatus.PUBLISHING.value:
+            if any(
+                pp.get("status") == SocialPlatformPostStatus.PUBLISHING.value for pp in platforms
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Post is already publishing",
+                )
         now = utcnow()
         self.db["social_posts"].update_one(
             {"id": post["id"]},
             {
                 "$set": {
-                    "status": SocialPostStatus.PUBLISHING.value,
                     "scheduled_at": post.get("scheduled_at") or now,
                     "updated_at": now,
                 }

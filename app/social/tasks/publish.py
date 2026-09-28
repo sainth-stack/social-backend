@@ -50,8 +50,13 @@ def publish_post(self, post_id: str) -> dict:
         return {"ok": True, "reason": "already_done"}
 
     if post.get("status") == SocialPostStatus.PUBLISHING.value:
+        platforms_snapshot = list(db["social_post_platforms"].find({"post_id": post_id}))
+        any_platform_active = any(
+            pp.get("status") == SocialPlatformPostStatus.PUBLISHING.value
+            for pp in platforms_snapshot
+        )
         updated = post.get("updated_at")
-        if updated:
+        if updated and any_platform_active:
             if updated.tzinfo is None:
                 updated = updated.replace(tzinfo=timezone.utc)
             age = datetime.now(timezone.utc) - updated
