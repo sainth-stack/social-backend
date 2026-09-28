@@ -41,6 +41,18 @@ class Settings(BaseSettings):
         validation_alias="GOOGLE_REDIRECT_URI",
     )
 
+    @property
+    def resolved_google_redirect_uri(self) -> str:
+        """OAuth callback on the API host. Same domain as FRONTEND_URL when nginx proxies /api."""
+        explicit = (self.google_redirect_uri or "").strip()
+        default_local = "http://localhost:8000/api/v1/auth/google/callback"
+        if explicit and explicit != default_local:
+            return explicit
+        front = self.frontend_url.rstrip("/")
+        if front.startswith("https://") and "localhost" not in front and "127.0.0.1" not in front:
+            return f"{front}{self.api_v1_prefix}/auth/google/callback"
+        return explicit or default_local
+
     # ── Platform admin bootstrap ──────────────────────────────────────────────
     admin_email: Optional[str] = Field(default=None, validation_alias="ADMIN_EMAIL")
     admin_password: Optional[str] = Field(default=None, validation_alias="ADMIN_PASSWORD")

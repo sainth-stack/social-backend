@@ -46,7 +46,7 @@ class AnalyticsAggregator:
 
         by_day_platform: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         for r in rows:
-            key = r["date"].isoformat() if isinstance(r["date"], date) else str(r["date"])[:10]
+            key = as_date(r["date"]).isoformat()
             by_day_platform[key][r.get("platform", "")] += int(r.get("total_engagements") or 0)
 
         engagement_series = []
@@ -100,9 +100,7 @@ class AnalyticsAggregator:
 
         series = []
         day = start
-        by_day = {
-            (r["date"] if isinstance(r["date"], date) else r["date"]): r for r in rows
-        }
+        by_day = {as_date(r["date"]): r for r in rows}
         while day <= end:
             r = by_day.get(day)
             series.append(
@@ -248,7 +246,7 @@ class AnalyticsAggregator:
 
         by_day_platform: dict[str, dict[str, dict]] = defaultdict(dict)
         for r in rows:
-            day_str = r["date"].isoformat() if isinstance(r["date"], date) else str(r["date"])[:10]
+            day_str = as_date(r["date"]).isoformat()
             by_day_platform[day_str][r.get("platform", "")] = {
                 "followers": int(r.get("follower_count") or 0),
                 "newFollowers": int(r.get("new_followers") or 0),
@@ -297,7 +295,7 @@ class AnalyticsAggregator:
             self.db["social_analytics_daily"].find(
                 {
                     "workspace_id": str(workspace_id),
-                    "date": {"$gte": start, "$lte": end},
+                    "date": date_range_filter(start, end),
                 }
             ).sort("date", 1)
         )
@@ -357,7 +355,7 @@ class AnalyticsAggregator:
             row["total_impressions"] = int(row.get("total_impressions") or 0) + int(pp.get("impressions") or 0)
             row["total_engagements"] = int(row.get("total_engagements") or 0) + _engagement(pp)
             row["total_clicks"] = int(row.get("total_clicks") or 0) + int(pp.get("clicks") or 0)
-        return sorted(buckets.values(), key=lambda r: r["date"])
+        return sorted(buckets.values(), key=lambda r: as_date(r["date"]))
 
     def _platform_comparison(
         self, workspace_id: str, start: date, end: date, rows: list[dict]
@@ -414,5 +412,4 @@ class AnalyticsAggregator:
             )
         return result
 
-
-from app.core.mongo_utils import new_id
+from app.core.mongo_utils import as_date, date_range_filter, new_id

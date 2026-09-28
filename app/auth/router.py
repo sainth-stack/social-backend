@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from urllib.parse import quote
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from pymongo.database import Database
 
 from app.auth.deps import get_current_user
-from app.auth.google import build_google_auth_url, complete_google_sign_in
+from app.auth.google import (
+    build_google_auth_url,
+    complete_google_sign_in,
+    google_oauth_configured,
+)
 from app.auth.schemas import (
     ForgotPasswordRequest,
     ForgotPasswordResponse,
@@ -92,6 +98,11 @@ def reset_password_endpoint(
     return ResetPasswordResponse()
 
 
+@router.get("/google/status")
+def google_auth_status() -> dict[str, bool]:
+    return {"enabled": google_oauth_configured()}
+
+
 @router.get("/google/url")
 def google_auth_url() -> dict[str, str]:
     return {"url": build_google_auth_url()}
@@ -99,11 +110,20 @@ def google_auth_url() -> dict[str, str]:
 
 @router.get("/google/callback")
 def google_auth_callback(
-    code: str = Query(...),
-    state: str = Query(...),
+    code: Optional[str] = Query(default=None),
+    state: Optional[str] = Query(default=None),
+    error: Optional[str] = Query(default=None),
+    error_description: Optional[str] = Query(default=None),
     db: Database = Depends(get_db),
 ) -> RedirectResponse:
     frontend = settings.frontend_url.rstrip("/")
+    if error:
+        msg = error_description or error
+        return RedirectResponse(url=f"{frontend}/auth/google/callback?error={quote(msg)}")
+    if not code or not state:
+        return RedirectResponse(
+            url=f"{frontend}/auth/google/callback?error={quote('Google sign-in was cancelled')}"
+        )
     try:
         _, token = complete_google_sign_in(db, code, state)
         return RedirectResponse(url=f"{frontend}/auth/google/callback?token={token}")

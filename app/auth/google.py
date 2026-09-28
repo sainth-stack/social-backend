@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 from typing import Any
 from urllib.parse import urlencode
@@ -15,6 +16,8 @@ from app.core.config import settings
 from app.core.mongo_utils import new_id, utcnow
 from app.workspaces.models import SocialLevel, WorkspacePlan, WorkspaceRole
 from workers.redis.client import get_redis_client
+
+logger = logging.getLogger(__name__)
 
 GOOGLE_AUTH_STATE_TTL = 600
 GOOGLE_AUTH_STATE_PREFIX = "google_auth_state:"
@@ -35,7 +38,7 @@ def build_google_auth_url() -> str:
     redis.setex(f"{GOOGLE_AUTH_STATE_PREFIX}{state}", GOOGLE_AUTH_STATE_TTL, "1")
     params = {
         "client_id": settings.google_client_id,
-        "redirect_uri": settings.google_redirect_uri,
+        "redirect_uri": settings.resolved_google_redirect_uri,
         "response_type": "code",
         "scope": "openid email profile",
         "state": state,
@@ -70,12 +73,35 @@ def exchange_google_code(code: str) -> dict[str, Any]:
                     "code": code,
                     "client_id": settings.google_client_id,
                     "client_secret": settings.google_client_secret,
-                    "redirect_uri": settings.google_redirect_uri,
+                    "redirect_uri": settings.resolved_google_redirect_uri,
                     "grant_type": "authorization_code",
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
             if token_resp.status_code >= 400:
+                try:
+                    err_body = token_resp.json()
+                    err_code = err_body.get("error", "")
+                    err_desc = err_body.get("error_description", "")
+                except Exception:
+                    err_code = ""
+                    err_desc = token_resp.text[:200]
+                logger.warning(
+                    "Google token exchange failed: %s %s (redirect_uri=%s)",
+                    err_code,
+                    err_desc,
+                    settings.resolved_google_redirect_uri,
+                )
+                if err_code == "redirect_uri_mismatch":
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=(
+                            "Google redirect URI mismatch. Add this exact URL under "
+                            "Google Cloud Console → APIs & Services → Credentials → "
+                            "OAuth client → Authorized redirect URIs: "
+                            f"{settings.resolved_google_redirect_uri}"
+                        ),
+                    )
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Google sign-in failed — try again",

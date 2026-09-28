@@ -11,7 +11,7 @@ from pymongo.database import Database
 
 from app.core.config import settings
 from app.core.encryption import decrypt
-from app.core.mongo_utils import new_id, utcnow
+from app.core.mongo_utils import as_date, date_range_filter, new_id, utc_midnight, utcnow
 from app.social.models import SocialPlatform, SocialPlatformPostStatus
 from app.social.oauth.base import get_oauth_handler
 
@@ -59,7 +59,7 @@ def sync_account_daily(
     # Previous day follower count for new_followers
     prev_day = (datetime.combine(day, datetime.min.time()) - timedelta(days=1)).date()
     prev = db["social_analytics_daily"].find_one(
-        {"social_account_id": account["id"], "date": prev_day}
+        {"social_account_id": account["id"], "date": utc_midnight(prev_day)}
     )
     prev_followers = int(prev.get("follower_count") or follower_count) if prev else follower_count
     new_followers = max(0, follower_count - prev_followers)
@@ -86,14 +86,15 @@ def sync_account_daily(
     total_clicks = sum(int(p.get("clicks") or 0) for p in platforms)
 
     row = db["social_analytics_daily"].find_one(
-        {"social_account_id": account["id"], "date": day}
+        {"social_account_id": account["id"], "date": utc_midnight(day)}
     )
 
+    day_dt = utc_midnight(day)
     update_doc = {
         "workspace_id": account["workspace_id"],
         "social_account_id": account["id"],
         "platform": account["platform"],
-        "date": day,
+        "date": day_dt,
         "follower_count": follower_count,
         "new_followers": new_followers,
         "posts_count": posts_count,
@@ -109,10 +110,10 @@ def sync_account_daily(
         return update_doc
     else:
         db["social_analytics_daily"].update_one(
-            {"social_account_id": account["id"], "date": day}, {"$set": update_doc}
+            {"social_account_id": account["id"], "date": day_dt}, {"$set": update_doc}
         )
         return db["social_analytics_daily"].find_one(
-            {"social_account_id": account["id"], "date": day}
+            {"social_account_id": account["id"], "date": day_dt}
         )
 
 
