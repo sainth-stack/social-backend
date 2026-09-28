@@ -668,17 +668,45 @@ class SocialMediaService:
         return self.update_post(post, workspace, UpdateSocialPostRequest(**update_kwargs))
 
     def delete_post(self, post: dict) -> None:
-        if post.get("status") not in (
+        post_id = str(post["id"])
+        fresh = self.db["social_posts"].find_one({"id": post_id})
+        if not fresh:
+            return
+        status = fresh.get("status")
+
+        if status == SocialPostStatus.PUBLISHING.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot delete while the post is publishing — try again in a moment",
+            )
+
+        if status == SocialPostStatus.SCHEDULED.value:
+            self.db["social_posts"].update_one(
+                {"id": post_id},
+                {
+                    "$set": {
+                        "status": SocialPostStatus.DRAFT.value,
+                        "scheduled_at": None,
+                        "updated_at": utcnow(),
+                    }
+                },
+            )
+            status = SocialPostStatus.DRAFT.value
+
+        deletable = {
             SocialPostStatus.DRAFT.value,
             SocialPostStatus.ARCHIVED.value,
             SocialPostStatus.FAILED.value,
-        ):
+            SocialPostStatus.PUBLISHED.value,
+        }
+        if status not in deletable:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Only draft, failed, or archived posts can be deleted",
+                detail=f"Cannot delete a post in status {status}",
             )
-        self.db["social_post_platforms"].delete_many({"post_id": post["id"]})
-        self.db["social_posts"].delete_one({"id": post["id"]})
+
+        self.db["social_post_platforms"].delete_many({"post_id": post_id})
+        self.db["social_posts"].delete_one({"id": post_id})
 
     def schedule_post(self, post: dict, payload: SchedulePostRequest) -> SocialPostOut:
         platforms = _get_post_platforms(self.db, post["id"])
