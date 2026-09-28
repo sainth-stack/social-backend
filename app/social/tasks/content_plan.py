@@ -54,8 +54,17 @@ def generate_content_plan_task(
         meta={"current": 0, "total": total, "message": "Starting content plan…"},
     )
     try:
+        from app.social.content_plan_jobs import is_content_plan_cancelled
+
+        def cancel_check() -> bool:
+            return is_content_plan_cancelled(self.request.id)
+
         result = ContentPlanService(db).generate(
-            workspace, user, request, progress_callback=progress
+            workspace,
+            user,
+            request,
+            progress_callback=progress,
+            cancel_check=cancel_check,
         )
         return result.model_dump(mode="json")
     except HTTPException as exc:
@@ -70,3 +79,7 @@ def generate_content_plan_task(
         msg = format_task_exception(exc)
         logger.exception("generate_content_plan_task failed workspace=%s: %s", workspace_id, msg)
         raise RuntimeError(msg) from exc
+    finally:
+        from app.social.content_plan_jobs import clear_content_plan_job_flags
+
+        clear_content_plan_job_flags(self.request.id)

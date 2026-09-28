@@ -427,6 +427,9 @@ def generate_content_plan(
             args=[str(workspace["id"]), str(current_user["id"]), payload.model_dump(mode="json")],
             queue="social_maintenance",
         )
+        from app.social.content_plan_jobs import register_content_plan_job
+
+        register_content_plan_job(task.id, str(workspace["id"]))
         return ContentPlanJobStartResponse(jobId=task.id)
     except Exception as exc:
         logger.warning("Celery enqueue failed, running content plan synchronously: %s", exc)
@@ -434,7 +437,9 @@ def generate_content_plan(
         # Store completed result in Celery backend via a pseudo task id pattern
         sync_id = f"sync-{uuid.uuid4()}"
         from workers.celery_app import celery_app
+        from app.social.content_plan_jobs import register_content_plan_job
 
+        register_content_plan_job(sync_id, str(workspace["id"]))
         celery_app.backend.store_result(
             sync_id,
             result.model_dump(mode="json"),
@@ -510,6 +515,22 @@ def get_content_plan_job(
             error=celery_failure_message(result, fallback="Content plan job failed"),
         )
     return ContentPlanJobStatusResponse(jobId=job_id, status=state.lower())
+
+
+@router.post("/content-plan/jobs/{job_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
+def cancel_content_plan_job(
+    job_id: str,
+    workspace: dict = Depends(require_workspace_access),
+    _: dict = Depends(get_current_user),
+) -> dict:
+    """Request cancellation of a running content plan job (checked between days)."""
+    from app.social.content_plan_jobs import request_content_plan_cancel, verify_content_plan_job_workspace
+    from workers.celery_app import celery_app
+
+    verify_content_plan_job_workspace(job_id, str(workspace["id"]))
+    request_content_plan_cancel(job_id)
+    celery_app.control.revoke(job_id, terminate=False)
+    return {"jobId": job_id, "cancelled": True}
 
 
 # ── Analytics ─────────────────────────────────────────────────────────────────

@@ -397,6 +397,10 @@ class ContentPlanGenerateRequest(BaseModel):
         max_length=10,
         description="Generate one post for this date (YYYY-MM-DD). Overrides days.",
     )
+    platforms: Optional[List[SocialPlatform]] = Field(
+        default=None,
+        description="Publishable platforms to use (facebook/instagram). Default: all connected.",
+    )
 
 
 class ContentPlanJobStartResponse(BaseModel):

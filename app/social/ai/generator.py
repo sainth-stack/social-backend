@@ -11,6 +11,7 @@ from typing import Any, Optional
 from fastapi import HTTPException, status
 
 from app.social.ai.prompts import (
+    GENERIC_FILLER_PHRASES,
     PLATFORM_LIMITS,
     build_system_prompt,
     build_user_prompt,
@@ -89,6 +90,20 @@ def _trim_caption(caption: str, limit: int) -> str:
     return window[: limit - 1].rstrip() + "…"
 
 
+def _caption_needs_polish(caption: str, platform_key: str) -> bool:
+    text = (caption or "").strip()
+    if len(text) < 40:
+        return True
+    low = text.lower()
+    if any(phrase in low for phrase in GENERIC_FILLER_PHRASES):
+        return True
+    if platform_key == SocialPlatform.X.value:
+        return len(text) < 80
+    if len(text) < 180:
+        return True
+    return False
+
+
 def _normalize_hashtags(raw: Any, limit: int) -> list[str]:
     if not isinstance(raw, list):
         return []
@@ -148,6 +163,7 @@ def _chat_completion(
     max_completion_tokens: int,
     prefer_json: bool = True,
     reasoning_effort: Optional[str] = "low",
+    temperature: Optional[float] = None,
 ) -> Any:
     """Call chat completions; tolerate deployments that reject optional params."""
     base: dict[str, Any] = {
@@ -155,6 +171,8 @@ def _chat_completion(
         "messages": messages,
         "max_completion_tokens": max_completion_tokens,
     }
+    if temperature is not None:
+        base["temperature"] = temperature
     # Prefer low reasoning so output tokens are not starved (gpt-5 family).
     attempts: list[dict[str, Any]] = []
     if prefer_json and reasoning_effort:
@@ -199,6 +217,7 @@ def _complete_json(
     system_prompt: str,
     user_prompt: str,
     platform_key: str,
+    temperature: Optional[float] = None,
 ) -> str:
     messages = [
         {"role": "system", "content": system_prompt},
@@ -210,6 +229,7 @@ def _complete_json(
         model=model,
         messages=messages,
         max_completion_tokens=_MAX_COMPLETION_TOKENS,
+        temperature=temperature,
     )
     choice = response.choices[0]
     message = choice.message
@@ -286,6 +306,7 @@ def _generate_one_platform(
     include_hashtags: bool,
     include_comment: bool,
     brand_voice: Optional[dict[str, Any]],
+    content_series_mode: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     limit = PLATFORM_LIMITS.get(platform_key, 2200)
     hashtag_limit = 30 if platform_key == SocialPlatform.INSTAGRAM.value else 5
@@ -295,8 +316,14 @@ def _generate_one_platform(
     if include_hashtags and platform_key == SocialPlatform.X.value:
         caption_budget = max(120, limit - 36)
 
+    series_mode = content_series_mode
+    temp = 0.55 if series_mode else None
+
     system_prompt = build_system_prompt(
-        brand_voice, platform_key, caption_budget=caption_budget
+        brand_voice,
+        platform_key,
+        caption_budget=caption_budget,
+        content_series_mode=series_mode,
     )
     user_prompt = build_user_prompt(
         topic=topic,
@@ -308,16 +335,21 @@ def _generate_one_platform(
         include_comment=include_comment,
         brand_voice=brand_voice,
         caption_budget=caption_budget,
+        content_series_mode=series_mode,
     )
 
-    try:
-        raw = _complete_json(
+    def _run(user: str) -> str:
+        return _complete_json(
             client=client,
             model=model,
             system_prompt=system_prompt,
-            user_prompt=user_prompt,
+            user_prompt=user,
             platform_key=platform_key,
+            temperature=temp,
         )
+
+    try:
+        raw = _run(user_prompt)
     except HTTPException:
         raise
     except Exception as exc:
@@ -338,6 +370,32 @@ def _generate_one_platform(
     if hashtags:
         tags_text = " " + " ".join(f"#{t}" for t in hashtags)
     caption = _trim_caption(caption_raw, max(1, limit - len(tags_text)))
+
+    if series_mode and caption and _caption_needs_polish(caption, platform_key):
+        logger.info("Social generate polish retry for %s (weak first draft)", platform_key)
+        polish_user = (
+            user_prompt
+            + "\n\nREVISION: The first draft was too short or generic. Rewrite at flagship "
+            "product-company quality — specific hook, concrete value, ~350–900 characters for "
+            "Instagram/Facebook if limit allows. Ban clichés. JSON only."
+        )
+        try:
+            raw2 = _run(polish_user)
+            parsed2 = _parse_json_content(raw2)
+            cap2, tags2, fc2 = _extract_fields(parsed2)
+            hashtags2 = (
+                _normalize_hashtags(tags2, hashtag_limit) if include_hashtags else []
+            )
+            tags_text2 = ""
+            if hashtags2:
+                tags_text2 = " " + " ".join(f"#{t}" for t in hashtags2)
+            caption2 = _trim_caption(cap2, max(1, limit - len(tags_text2)))
+            if caption2 and not _caption_needs_polish(caption2, platform_key):
+                caption = caption2
+                hashtags = hashtags2
+                first_comment = fc2.strip() if include_comment else first_comment
+        except Exception:
+            pass
 
     if not caption:
         logger.error(
@@ -374,6 +432,7 @@ def generate_platform_content(
     include_hashtags: bool,
     include_comment: bool,
     brand_voice: Optional[dict[str, Any]],
+    content_series_mode: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Return { platform: { caption, hashtags, firstComment, characterCount } }.
 
@@ -428,6 +487,7 @@ def generate_platform_content(
                 include_hashtags=include_hashtags,
                 include_comment=include_comment,
                 brand_voice=brand_voice,
+                content_series_mode=content_series_mode,
             ): key
             for key in platform_keys
         }

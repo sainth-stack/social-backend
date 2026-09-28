@@ -41,16 +41,16 @@ PLAN_DAY_CAP: dict[str, int] = {
 WEEKDAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 DAY_FOCUS_ANGLES = [
-    "Hook post — introduce the topic with a scroll-stopping opener",
-    "How-to tip — one actionable takeaway from the brief",
-    "Social proof — customer win or before/after story",
-    "Myth-bust — correct a misconception related to the brief",
-    "Checklist — quick wins the audience can use today",
-    "Trend take — connect the brief to something timely",
-    "Benefit / ROI — product or service value tied to the brief",
-    "Engagement — question that sparks comments and DMs",
-    "Deep dive — educational post that builds authority",
-    "Trust builder — founder or expert perspective with a CTA",
+    "Launch-week hook — one bold outcome or tension your ICP feels; no greeting, no fluff",
+    "Actionable how-to — one specific tactic from the brief with steps someone can do today",
+    "Customer story pattern — before/after or 'teams like yours' narrative (no fake names/stats)",
+    "Myth vs truth — debunk one misconception in your category; teach in 3–5 short beats",
+    "Checklist — 3–5 numbered quick wins tied to the product or service in the brief",
+    "Trend lens — tie the brief to what buyers care about this quarter (no fake news)",
+    "ROI / value — translate feature into time saved, risk reduced, or revenue protected",
+    "Conversation starter — one sharp question that earns comments/DMs; still deliver value first",
+    "Expert deep-dive — one framework or lesson that positions the brand as the guide",
+    "Trust + CTA — founder/expert voice, one proof pattern, one clear next step",
 ]
 
 
@@ -62,25 +62,61 @@ def build_plan_day_topic(
     *,
     user_prompt: str,
     brand_name: str,
+    brand: dict[str, Any],
+    platform: SocialPlatform,
     day_index: int,
     total_days: int,
     audience: Optional[str],
     day_focus: str,
+    tone: str,
+    cta: Optional[str],
 ) -> str:
+    industry = (brand.get("industry") or "your industry").strip()
+    tagline = (brand.get("tagline") or "").strip()
+    words_use = ", ".join(brand.get("words_to_use") or []) or "n/a"
+    words_avoid = ", ".join(brand.get("words_to_avoid") or []) or "n/a"
+    platform_label = platform.value
+    cta_line = cta or (brand.get("cta_phrases") or ["Get started"])[0]
+
     parts = [
-        f"Day {day_index} of {total_days} in a social content series.",
-        f"User brief: {user_prompt}",
-        f"Today's post focus: {day_focus}",
-        f"Brand: {brand_name}.",
+        f"CONTENT PLAN — Day {day_index} of {total_days} ({platform_label}).",
+        f"Campaign brief (source of truth): {user_prompt}",
+        f"Today's creative angle: {day_focus}",
+        f"Brand: {brand_name} · Industry: {industry}.",
     ]
+    if tagline:
+        parts.append(f"Tagline / positioning: {tagline}.")
     if audience:
         parts.append(f"Target audience: {audience}.")
-    parts.append(
-        "Write one ready-to-publish, professional, conversion-focused social post "
-        "that stays on the user's brief while matching today's focus. "
-        "Each day must feel distinct — do not repeat prior days."
+    parts.extend(
+        [
+            f"Tone: {tone}. Preferred CTA phrase to weave in naturally: \"{cta_line}\".",
+            f"Words to prefer: {words_use}. Words to avoid: {words_avoid}.",
+            f"Write for {platform_label} like a top product company's organic social — "
+            "publish-ready, specific, confident, zero generic AI filler.",
+            "Must be clearly different from other days in this series (new hook, new structure).",
+            "Do not invent fake metrics, client logos, testimonials, or URLs.",
+        ]
     )
     return " ".join(parts)
+
+
+def build_plan_image_brief(
+    *,
+    caption: str,
+    brand_name: str,
+    platform: SocialPlatform,
+    day_focus: str,
+    user_prompt: str,
+) -> str:
+    return (
+        f"Premium {platform.value} marketing visual for {brand_name}. "
+        f"Campaign context: {user_prompt[:200]}. "
+        f"Creative angle: {day_focus}. "
+        f"Post mood (do not render as text): {caption[:220]}. "
+        "Editorial product-brand photography, cinematic light, modern SaaS/consumer brand aesthetic, "
+        "single strong focal point, square crop, no watermarks, no readable text in image."
+    )
 
 
 def _plan_cap(workspace: dict) -> int:
@@ -231,6 +267,30 @@ def _connected_publishable(db: Database, workspace_id: str) -> list[dict]:
     )
 
 
+def _accounts_for_plan(
+    db: Database,
+    workspace_id: str,
+    platforms: Optional[list[SocialPlatform]],
+) -> list[dict]:
+    accounts = _connected_publishable(db, workspace_id)
+    if not platforms:
+        return accounts
+    allowed = {p.value if hasattr(p, "value") else str(p) for p in platforms}
+    allowed = allowed & {p.value for p in PUBLISHABLE}
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Select at least one platform: Facebook or Instagram.",
+        )
+    filtered = [a for a in accounts if str(a.get("platform")) in allowed]
+    if not filtered:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Connect the selected platform(s) before generating a plan.",
+        )
+    return filtered
+
+
 def _occupied_plan_dates(db: Database, workspace_id: str, tz_name: str) -> set[str]:
     tz = _tz(tz_name)
     posts = list(
@@ -284,7 +344,7 @@ class ContentPlanService:
                 status_code=status.HTTP_400_BAD_REQUEST, detail="days must be at least 1"
             )
 
-        accounts = _connected_publishable(self.db, workspace["id"])
+        accounts = _accounts_for_plan(self.db, workspace["id"], payload.platforms)
         if not accounts:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -332,6 +392,7 @@ class ContentPlanService:
         user: dict,
         payload: ContentPlanGenerateRequest,
         progress_callback: Optional[ProgressCallback] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> ContentPlanGenerateResponse:
         from app.plans.service import record_ai_usage
         from app.social.ai.generator import generate_platform_content
@@ -351,7 +412,7 @@ class ContentPlanService:
                 status_code=status.HTTP_400_BAD_REQUEST, detail="days must be at least 1"
             )
 
-        accounts = _connected_publishable(self.db, workspace["id"])
+        accounts = _accounts_for_plan(self.db, workspace["id"], payload.platforms)
         if not accounts:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -419,8 +480,14 @@ class ContentPlanService:
         draft_count = 0
         skipped_count = 0
         errors: list[str] = []
+        stopped_by_user = False
 
         for i, slot in enumerate(slots):
+            if cancel_check and cancel_check():
+                stopped_by_user = True
+                errors.append("Stopped by user — partial plan saved.")
+                break
+
             local_slot = slot.astimezone(_tz(tz_name))
             slot_date = local_slot.date().isoformat()
 
@@ -440,10 +507,14 @@ class ContentPlanService:
             topic = build_plan_day_topic(
                 user_prompt=user_prompt,
                 brand_name=brand_name,
+                brand=brand,
+                platform=platform,
                 day_index=i + 1,
                 total_days=len(slots),
                 audience=audience,
                 day_focus=day_focus,
+                tone=tone,
+                cta=cta,
             )
 
             try:
@@ -464,6 +535,7 @@ class ContentPlanService:
                     include_hashtags=True,
                     include_comment=False,
                     brand_voice=brand,
+                    content_series_mode=True,
                 )
             except Exception as exc:
                 logger.warning("Plan day %s caption failed: %s", i + 1, exc)
@@ -485,7 +557,13 @@ class ContentPlanService:
                     enforce_ai_image_limit(self.db, workspace)
                     record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"])
                     img_data = generate_post_image(
-                        topic=f"Social media image for: {caption[:180]}",
+                        topic=build_plan_image_brief(
+                            caption=caption,
+                            brand_name=brand_name,
+                            platform=platform,
+                            day_focus=day_focus,
+                            user_prompt=user_prompt,
+                        ),
                         style=image_style,
                         size="1024x1024",
                         mode="create",
@@ -603,6 +681,14 @@ class ContentPlanService:
             progress_callback(len(slots), len(slots), "Content plan complete")
 
         skip_note = f", {skipped_count} skipped" if skipped_count else ""
+        base_message = (
+            f"Planned {len(day_outs)} day(s)"
+            + (f", {scheduled_count} set to auto-post" if scheduled_count else "")
+            + skip_note
+            + ("." if not errors else f" · {len(errors)} note(s).")
+        )
+        if stopped_by_user:
+            base_message = f"Stopped — {base_message}"
         return ContentPlanGenerateResponse(
             days=len(day_outs),
             timezone=tz_name,
@@ -613,12 +699,7 @@ class ContentPlanService:
             items=day_outs,
             calendarItems=calendar_items,
             errors=errors,
-            message=(
-                f"Planned {len(day_outs)} day(s)"
-                + (f", {scheduled_count} set to auto-post" if scheduled_count else "")
-                + skip_note
-                + ("." if not errors else f" · {len(errors)} note(s).")
-            ),
+            message=base_message,
         )
 
     def _load_post(self, post_id: str) -> dict:
