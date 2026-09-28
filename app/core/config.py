@@ -5,16 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from pydantic import AliasChoices, Field
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy.engine import URL, make_url
-
-
-def normalize_database_url(raw: str) -> URL:
-    url = make_url(raw.strip())
-    if url.drivername == "postgresql":
-        return url.set(drivername="postgresql+psycopg2")
-    return url
 
 
 class Settings(BaseSettings):
@@ -53,20 +45,9 @@ class Settings(BaseSettings):
     admin_email: Optional[str] = Field(default=None, validation_alias="ADMIN_EMAIL")
     admin_password: Optional[str] = Field(default=None, validation_alias="ADMIN_PASSWORD")
 
-    # ── Database ──────────────────────────────────────────────────────────────
-    database_url_override: Optional[str] = Field(
-        default=None,
-        validation_alias=AliasChoices("DATABASE_URL", "SQLALCHEMY_DATABASE_URL"),
-    )
-    db_pool_size: int = Field(default=5, validation_alias="DB_POOL_SIZE")
-    db_max_overflow: int = Field(default=10, validation_alias="DB_MAX_OVERFLOW")
-    db_pool_timeout: int = Field(default=10, validation_alias="DB_POOL_TIMEOUT")
-
-    @property
-    def database_url(self) -> URL:
-        if self.database_url_override and self.database_url_override.strip():
-            return normalize_database_url(self.database_url_override)
-        raise RuntimeError("DATABASE_URL is required")
+    # ── Database — MongoDB ────────────────────────────────────────────────────
+    mongodb_url: str = Field(default="mongodb://localhost:27017", validation_alias="MONGODB_URL")
+    mongodb_db_name: str = Field(default="social_media", validation_alias="MONGODB_DB_NAME")
 
     # ── Cache / Queue — Redis ──────────────────────────────────────────────────
     redis_url: str = Field(default="redis://localhost:6379/0", validation_alias="REDIS_URL")
@@ -81,55 +62,14 @@ class Settings(BaseSettings):
     def resolved_celery_result_backend(self) -> str:
         return self.celery_result_backend or self.redis_url
 
-    # ── LLM — Azure OpenAI (chat + embeddings + image/video generation) ──────
-    azure_openai_api_key: Optional[str] = Field(default=None, validation_alias="AZURE_OPENAI_API_KEY")
-    azure_openai_endpoint: Optional[str] = Field(default=None, validation_alias="AZURE_OPENAI_ENDPOINT")
-    azure_openai_api_version: str = Field(
-        default="2024-08-01-preview", validation_alias="AZURE_OPENAI_API_VERSION"
-    )
-    azure_openai_deployment: str = Field(
-        default="gpt-5.4-nano", validation_alias="AZURE_OPENAI_DEPLOYMENT"
-    )
-    # Image generation — gpt-image-2 requires api-version=preview
-    azure_openai_image_deployment: str = Field(
-        default="gpt-image-2", validation_alias="AZURE_OPENAI_IMAGE_DEPLOYMENT"
-    )
-    azure_openai_image_api_version: str = Field(
-        default="preview", validation_alias="AZURE_OPENAI_IMAGE_API_VERSION"
-    )
-    # Video generation — Sora 2 (gated preview); optional separate endpoint
-    azure_openai_video_deployment: str = Field(
-        default="sora-2", validation_alias="AZURE_OPENAI_VIDEO_DEPLOYMENT"
-    )
-    azure_openai_video_api_version: str = Field(
-        default="preview", validation_alias="AZURE_OPENAI_VIDEO_API_VERSION"
-    )
-    azure_openai_video_endpoint: Optional[str] = Field(
-        default=None, validation_alias="AZURE_OPENAI_VIDEO_ENDPOINT"
-    )
-    azure_openai_video_api_key: Optional[str] = Field(
-        default=None, validation_alias="AZURE_OPENAI_VIDEO_API_KEY"
-    )
-    video_generation_enabled: bool = Field(
-        default=True, validation_alias="VIDEO_GENERATION_ENABLED"
-    )
+    # ── LLM — OpenAI ─────────────────────────────────────────────────────────
+    openai_api_key: Optional[str] = Field(default=None, validation_alias="OPENAI_API_KEY")
+    openai_base_url: str = Field(default="https://api.openai.com/v1", validation_alias="OPENAI_BASE_URL")
+    openai_deployment: str = Field(default="gpt-4o-mini", validation_alias="OPENAI_DEPLOYMENT")
+    openai_image_deployment: str = Field(default="dall-e-3", validation_alias="OPENAI_IMAGE_DEPLOYMENT")
+    video_generation_enabled: bool = Field(default=False, validation_alias="VIDEO_GENERATION_ENABLED")
 
-    # ── Object Storage — Azure Blob Storage ───────────────────────────────────
-    azure_storage_connection_string: Optional[str] = Field(
-        default=None, validation_alias="AZURE_STORAGE_CONNECTION_STRING"
-    )
-    azure_storage_account_name: Optional[str] = Field(
-        default=None, validation_alias="AZURE_STORAGE_ACCOUNT_NAME"
-    )
-    azure_storage_account_key: Optional[str] = Field(
-        default=None, validation_alias="AZURE_STORAGE_ACCOUNT_KEY"
-    )
-    azure_storage_container_name: Optional[str] = Field(
-        default=None, validation_alias="AZURE_STORAGE_CONTAINER_NAME"
-    )
-    azure_storage_prefix: str = Field(default="social", validation_alias="AZURE_STORAGE_PREFIX")
-
-    # ── Object Storage — Amazon S3 (preferred when credentials are set) ─────────
+    # ── Object Storage — Amazon S3 ────────────────────────────────────────────
     aws_access_key_id: Optional[str] = Field(default=None, validation_alias="AWS_ACCESS_KEY_ID")
     aws_secret_access_key: Optional[str] = Field(
         default=None, validation_alias="AWS_SECRET_ACCESS_KEY"

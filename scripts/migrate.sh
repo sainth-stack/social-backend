@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# Run Alembic migrations.
+# Ensure MongoDB is reachable and create indexes.
 #
 # Usage:
 #   ./scripts/migrate.sh
-#   ./scripts/migrate.sh current
-#   ./scripts/migrate.sh upgrade head
 
 set -euo pipefail
 
@@ -26,15 +24,12 @@ elif [[ -f "$ROOT/venv/bin/activate" ]]; then
   source "$ROOT/venv/bin/activate"
 fi
 
-if [[ -z "${DATABASE_URL:-}" ]]; then
-  echo "ERROR: DATABASE_URL is not set in .env" >&2
+if [[ -z "${MONGODB_URL:-}" ]]; then
+  echo "ERROR: MONGODB_URL is not set in .env" >&2
   exit 1
 fi
 
-if [[ $# -eq 0 ]]; then
-  set -- upgrade head
-fi
-
-echo "[migrate] running alembic $*"
+echo "[migrate] connecting to MongoDB and ensuring indexes"
 export PYTHONPATH="${PYTHONPATH:-}:$ROOT"
-exec alembic "$@"
+python -c "from app.core.database import init_db; init_db()"
+echo "[migrate] done"

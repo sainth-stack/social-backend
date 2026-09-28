@@ -7,7 +7,6 @@ import logging
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 logger = logging.getLogger(__name__)
@@ -30,18 +29,6 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={"detail": exc.errors()},
-        )
-
-    @app.exception_handler(SQLAlchemyError)
-    async def database_exception_handler(
-        request: Request, exc: SQLAlchemyError
-    ) -> JSONResponse:
-        logger.exception("Database error on %s %s", request.method, request.url.path)
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={
-                "detail": "Database is unavailable. Check DATABASE_URL and that PostgreSQL is running.",
-            },
         )
 
     @app.exception_handler(Exception)

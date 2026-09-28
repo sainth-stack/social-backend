@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import logging
-import uuid
 
-from app.core.database import SessionLocal
+from app.core.database import get_database
 from app.social.content_plan import ContentPlanService
 from app.social.schemas import ContentPlanGenerateRequest
-from app.users.models import User
-from app.workspaces.models import Workspace
 from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -27,39 +24,31 @@ def generate_content_plan_task(
     user_id: str,
     payload: dict,
 ) -> dict:
-    db = SessionLocal()
-    try:
-        workspace = db.get(Workspace, uuid.UUID(workspace_id))
-        user = db.get(User, uuid.UUID(user_id))
-        if not workspace or not user:
-            return {"error": "workspace_or_user_not_found"}
+    db = get_database()
 
-        request = ContentPlanGenerateRequest.model_validate(payload)
-        total = min(int(request.days), 30)
+    workspace = db["workspaces"].find_one({"id": str(workspace_id)})
+    user = db["users"].find_one({"id": str(user_id)})
+    if not workspace or not user:
+        return {"error": "workspace_or_user_not_found"}
 
-        def progress(current: int, total_days: int, message: str) -> None:
-            self.update_state(
-                state="PROGRESS",
-                meta={
-                    "current": current,
-                    "total": total_days,
-                    "message": message,
-                },
-            )
+    request = ContentPlanGenerateRequest.model_validate(payload)
+    total = min(int(request.days), 30)
 
+    def progress(current: int, total_days: int, message: str) -> None:
         self.update_state(
             state="PROGRESS",
-            meta={"current": 0, "total": total, "message": "Starting content plan…"},
+            meta={"current": current, "total": total_days, "message": message},
         )
+
+    self.update_state(
+        state="PROGRESS",
+        meta={"current": 0, "total": total, "message": "Starting content plan…"},
+    )
+    try:
         result = ContentPlanService(db).generate(
-            workspace,
-            user,
-            request,
-            progress_callback=progress,
+            workspace, user, request, progress_callback=progress
         )
         return result.model_dump(mode="json")
     except Exception as exc:
         logger.exception("generate_content_plan_task failed workspace=%s", workspace_id)
         raise exc
-    finally:
-        db.close()

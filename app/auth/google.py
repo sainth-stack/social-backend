@@ -8,13 +8,12 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import HTTPException, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from app.auth.service import issue_token_for_user
 from app.core.config import settings
-from app.users.models import User
-from app.workspaces.models import Workspace, WorkspaceMember, WorkspacePlan, WorkspaceRole, SocialLevel
+from app.core.mongo_utils import new_id, utcnow
+from app.workspaces.models import SocialLevel, WorkspacePlan, WorkspaceRole
 from workers.redis.client import get_redis_client
 
 GOOGLE_AUTH_STATE_TTL = 600
@@ -107,7 +106,7 @@ def exchange_google_code(code: str) -> dict[str, Any]:
         ) from exc
 
 
-def find_or_create_google_user(db: Session, profile: dict[str, Any]) -> User:
+def find_or_create_google_user(db: Database, profile: dict[str, Any]) -> dict:
     google_id = str(profile.get("sub") or "").strip()
     email = str(profile.get("email") or "").lower().strip()
     full_name = (profile.get("name") or profile.get("given_name") or "").strip() or None
@@ -123,57 +122,68 @@ def find_or_create_google_user(db: Session, profile: dict[str, Any]) -> User:
             detail="Google email is not verified",
         )
 
-    user = db.scalars(select(User).where(User.google_id == google_id)).first()
+    user = db["users"].find_one({"google_id": google_id})
     if not user:
-        user = db.scalars(select(User).where(User.email == email)).first()
+        user = db["users"].find_one({"email": email})
 
     if user:
-        if not user.is_active:
+        if not user.get("is_active"):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is suspended")
-        if not user.google_id:
-            user.google_id = google_id
-        if full_name and not user.full_name:
-            user.full_name = full_name
-        db.commit()
-        db.refresh(user)
+        updates: dict = {}
+        if not user.get("google_id"):
+            updates["google_id"] = google_id
+        if full_name and not user.get("full_name"):
+            updates["full_name"] = full_name
+        if updates:
+            updates["updated_at"] = utcnow()
+            db["users"].update_one({"id": user["id"]}, {"$set": updates})
+            user = db["users"].find_one({"id": user["id"]})
         return user
 
-    user = User(
-        email=email,
-        password_hash=None,
-        google_id=google_id,
-        full_name=full_name,
-        is_active=True,
-        is_platform_admin=False,
-    )
-    db.add(user)
-    db.flush()
+    now = utcnow()
+    user_id = new_id()
+    user = {
+        "id": user_id,
+        "email": email,
+        "password_hash": None,
+        "google_id": google_id,
+        "full_name": full_name,
+        "is_active": True,
+        "is_platform_admin": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    db["users"].insert_one(user)
 
     workspace_name = (
         f"{full_name}'s Workspace" if full_name else f"{email.split('@')[0]}'s Workspace"
     )
-    workspace = Workspace(
-        name=workspace_name,
-        plan=WorkspacePlan.STARTER,
-        owner_user_id=user.id,
-        is_active=True,
+    ws_id = new_id()
+    db["workspaces"].insert_one(
+        {
+            "id": ws_id,
+            "name": workspace_name,
+            "plan": WorkspacePlan.STARTER.value,
+            "owner_user_id": user_id,
+            "is_active": True,
+            "created_at": now,
+            "updated_at": now,
+        }
     )
-    db.add(workspace)
-    db.flush()
-    db.add(
-        WorkspaceMember(
-            user_id=user.id,
-            workspace_id=workspace.id,
-            role=WorkspaceRole.OWNER,
-            social_level=SocialLevel.ADMIN,
-        )
+    db["workspace_members"].insert_one(
+        {
+            "id": new_id(),
+            "user_id": user_id,
+            "workspace_id": ws_id,
+            "role": WorkspaceRole.OWNER.value,
+            "social_level": SocialLevel.ADMIN.value,
+            "created_at": now,
+        }
     )
-    db.commit()
-    db.refresh(user)
     return user
 
 
-def complete_google_sign_in(db: Session, code: str, state: str) -> tuple[User, str]:
+def complete_google_sign_in(db: Database, code: str, state: str) -> tuple[dict, str]:
     verify_google_state(state)
     profile = exchange_google_code(code)
     user = find_or_create_google_user(db, profile)

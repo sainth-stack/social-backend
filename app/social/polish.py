@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session, selectinload
+from pymongo.database import Database
 
-from app.workspaces.models import SocialLevel, Workspace, WorkspaceMember
-from app.users.models import User
+from app.core.mongo_utils import new_id, utcnow
 from app.social.audit import write_social_audit
 from app.social.limits import (
     enforce_approval_available,
@@ -20,14 +17,9 @@ from app.social.limits import (
     usage_snapshot,
 )
 from app.social.models import (
-    SocialAccount,
     SocialApprovalStatus,
-    SocialAuditLog,
     SocialPermission,
-    SocialPost,
     SocialPostStatus,
-    SocialSettings,
-    SocialTemplate,
 )
 from app.social.template_utils import (
     apply_template_fields,
@@ -35,6 +27,7 @@ from app.social.template_utils import (
     merge_placeholder_values,
 )
 from app.social.permissions import can_manage_team, get_user_permission, require_permission
+from app.workspaces.models import SocialLevel
 
 DEFAULT_NOTIFICATION_EVENTS = {
     "post_published": True,
@@ -64,25 +57,26 @@ DEFAULT_POSTING_TIMES = {
 
 
 class SocialPolishService:
-    def __init__(self, db: Session) -> None:
+    def __init__(self, db: Database) -> None:
         self.db = db
 
     # ── Settings ──────────────────────────────────────────────────────────────
 
-    def get_settings(self, workspace: Workspace) -> dict:
-        row = self._settings_row(workspace.id, create=False)
+    def get_settings(self, workspace: dict) -> dict:
+        row = self._settings_row(workspace["id"], create=False)
         return self._serialize_settings(row, workspace)
 
     def update_settings(
         self,
-        workspace: Workspace,
-        user: User,
+        workspace: dict,
+        user: dict,
         payload: dict,
     ) -> dict:
         require_permission(self.db, workspace, user, SocialPermission.ADMIN)
         if payload.get("approvalRequired"):
             enforce_approval_available(self.db, workspace)
-        row = self._settings_row(workspace.id, create=True)
+        row = self._settings_row(workspace["id"], create=True)
+
         mapping = {
             "timezone": "timezone",
             "defaultLanguage": "default_language",
@@ -104,41 +98,44 @@ class SocialPolishService:
             "notificationEvents": "notification_events",
             "notificationDelivery": "notification_delivery",
         }
+        updates: dict = {}
         for api_key, attr in mapping.items():
             if api_key in payload:
-                setattr(row, attr, payload[api_key])
-        self.db.commit()
+                updates[attr] = payload[api_key]
+
+        if updates:
+            self.db["social_settings"].update_one(
+                {"workspace_id": workspace["id"]}, {"$set": updates}
+            )
+
+        row = self._settings_row(workspace["id"], create=False)
         write_social_audit(
             self.db,
-            workspace_id=workspace.id,
-            user_id=user.id,
+            workspace_id=workspace["id"],
+            user_id=user["id"],
             action="setting.updated",
             entity_type="setting",
-            entity_id=row.id,
-            commit=True,
+            entity_id=row.get("id") if row else None,
         )
         return self._serialize_settings(row, workspace)
 
     # ── Team permissions ──────────────────────────────────────────────────────
-    #
-    # WorkspaceMember.social_level is the single source of truth for social
-    # permissions — there is no separate permissions table. The workspace
-    # owner always shows as "admin" even without an explicit membership row.
 
-    def list_team_permissions(self, workspace: Workspace) -> list[dict]:
-        rows = self.db.execute(
-            select(WorkspaceMember, User)
-            .join(User, User.id == WorkspaceMember.user_id)
-            .where(WorkspaceMember.workspace_id == workspace.id)
-        ).all()
+    def list_team_permissions(self, workspace: dict) -> list[dict]:
+        memberships = list(
+            self.db["workspace_members"].find({"workspace_id": workspace["id"]})
+        )
         items = []
-        for member, user in rows:
+        for member in memberships:
+            user = self.db["users"].find_one({"id": member["user_id"]})
+            if not user:
+                continue
             permission = get_user_permission(self.db, workspace, user).value
             items.append(
                 {
-                    "userId": str(user.id),
-                    "name": user.full_name or user.email,
-                    "email": user.email,
+                    "userId": str(user["id"]),
+                    "name": user.get("full_name") or user["email"],
+                    "email": user["email"],
                     "permission": permission,
                 }
             )
@@ -146,65 +143,59 @@ class SocialPolishService:
 
     def update_team_permission(
         self,
-        workspace: Workspace,
-        actor: User,
-        user_id: uuid.UUID,
+        workspace: dict,
+        actor: dict,
+        user_id: str,
         permission: SocialPermission,
     ) -> dict:
         if not can_manage_team(actor, workspace, self.db):
             require_permission(self.db, workspace, actor, SocialPermission.ADMIN)
 
-        member = self.db.execute(
-            select(WorkspaceMember).where(
-                WorkspaceMember.workspace_id == workspace.id,
-                WorkspaceMember.user_id == user_id,
-            )
-        ).scalar_one_or_none()
+        member = self.db["workspace_members"].find_one(
+            {"workspace_id": workspace["id"], "user_id": str(user_id)}
+        )
         if not member:
             raise HTTPException(status_code=404, detail="Team member not found")
 
-        user = self.db.get(User, user_id)
-        member.social_level = SocialLevel(permission.value)
-        self.db.commit()
+        user = self.db["users"].find_one({"id": str(user_id)})
+        self.db["workspace_members"].update_one(
+            {"workspace_id": workspace["id"], "user_id": str(user_id)},
+            {"$set": {"social_level": SocialLevel(permission.value).value}},
+        )
         write_social_audit(
             self.db,
-            workspace_id=workspace.id,
-            user_id=actor.id,
+            workspace_id=workspace["id"],
+            user_id=actor["id"],
             action="permission.updated",
             entity_type="user",
-            entity_id=user_id,
+            entity_id=str(user_id),
             metadata={"permission": permission.value},
-            commit=True,
         )
         return {
-            "userId": str(user.id),
-            "name": user.full_name or user.email,
-            "email": user.email,
+            "userId": str(user["id"]) if user else str(user_id),
+            "name": (user.get("full_name") or user["email"]) if user else str(user_id),
+            "email": user["email"] if user else "",
             "permission": permission.value,
         }
 
     # ── Templates ─────────────────────────────────────────────────────────────
 
-    def list_templates(self, workspace: Workspace, user: User) -> list[dict]:
+    def list_templates(self, workspace: dict, user: dict) -> list[dict]:
         self.ensure_system_templates(workspace, user)
-        rows = self.db.scalars(
-            select(SocialTemplate)
-            .where(SocialTemplate.workspace_id == workspace.id)
-            .order_by(SocialTemplate.is_system.desc(), SocialTemplate.sort_order.asc(), SocialTemplate.created_at.desc())
-        ).all()
+        rows = list(
+            self.db["social_templates"]
+            .find({"workspace_id": workspace["id"]})
+            .sort([("is_system", -1), ("sort_order", 1), ("created_at", -1)])
+        )
         return [self._serialize_template(r) for r in rows]
 
-    def ensure_system_templates(self, workspace: Workspace, user: User) -> None:
-        """Idempotently provision system templates for an workspace."""
+    def ensure_system_templates(self, workspace: dict, user: dict) -> None:
         existing_keys = {
-            row.system_key
-            for row in self.db.scalars(
-                select(SocialTemplate).where(
-                    SocialTemplate.workspace_id == workspace.id,
-                    SocialTemplate.is_system.is_(True),
-                )
-            ).all()
-            if row.system_key
+            row.get("system_key")
+            for row in self.db["social_templates"].find(
+                {"workspace_id": workspace["id"], "is_system": True}
+            )
+            if row.get("system_key")
         }
 
         created = False
@@ -212,67 +203,64 @@ class SocialPolishService:
             system_key = str(row.get("id", "")).strip()
             if not system_key or system_key in existing_keys:
                 continue
-            self.db.add(
-                SocialTemplate(
-                    id=uuid.uuid4(),
-                    workspace_id=workspace.id,
-                    name=str(row.get("name", "Untitled")).strip(),
-                    category=str(row.get("category", "general")).strip(),
-                    platforms=list(row.get("platforms") or []),
-                    caption_template=str(row.get("captionTemplate", "")).strip(),
-                    hashtags=list(row.get("hashtags") or []),
-                    is_system=True,
-                    system_key=system_key,
-                    description=str(row.get("description", "")).strip(),
-                    goal=str(row.get("goal", "general")).strip(),
-                    placeholders=list(row.get("placeholders") or []),
-                    image_prompt=str(row.get("imagePrompt", "")).strip(),
-                    generate_image=bool(row.get("generateImage", False)),
-                    suggested_tone=str(row.get("suggestedTone", "Professional")).strip(),
-                    suggested_cta=str(row.get("suggestedCta", "")).strip(),
-                    first_comment_template=str(row.get("firstCommentTemplate", "")).strip(),
-                    sort_order=int(row.get("sortOrder", 0)),
-                    created_by=user.id,
-                )
+            now = utcnow()
+            self.db["social_templates"].insert_one(
+                {
+                    "id": new_id(),
+                    "workspace_id": workspace["id"],
+                    "name": str(row.get("name", "Untitled")).strip(),
+                    "category": str(row.get("category", "general")).strip(),
+                    "platforms": list(row.get("platforms") or []),
+                    "caption_template": str(row.get("captionTemplate", "")).strip(),
+                    "hashtags": list(row.get("hashtags") or []),
+                    "is_system": True,
+                    "system_key": system_key,
+                    "description": str(row.get("description", "")).strip(),
+                    "goal": str(row.get("goal", "general")).strip(),
+                    "placeholders": list(row.get("placeholders") or []),
+                    "image_prompt": str(row.get("imagePrompt", "")).strip(),
+                    "generate_image": bool(row.get("generateImage", False)),
+                    "suggested_tone": str(row.get("suggestedTone", "Professional")).strip(),
+                    "suggested_cta": str(row.get("suggestedCta", "")).strip(),
+                    "first_comment_template": str(row.get("firstCommentTemplate", "")).strip(),
+                    "sort_order": int(row.get("sortOrder", 0)),
+                    "created_by": user["id"],
+                    "created_at": now,
+                }
             )
             created = True
 
-        if created:
-            self.db.commit()
-
     def apply_template(
         self,
-        workspace: Workspace,
-        user: User,
-        template_id: uuid.UUID,
+        workspace: dict,
+        user: dict,
+        template_id: str,
         payload: dict,
     ) -> dict:
         require_permission(self.db, workspace, user, SocialPermission.EDITOR)
         self.ensure_system_templates(workspace, user)
-        row = self._get_template(workspace.id, template_id)
+        row = self._get_template(workspace["id"], template_id)
 
-        from app.social.models import SocialBrandVoice
-
-        voice = self.db.scalars(
-            select(SocialBrandVoice).where(SocialBrandVoice.workspace_id == workspace.id)
-        ).first()
-        brand_name = voice.brand_name if voice else workspace.name
-        industry = voice.industry if voice else ""
+        voice = self.db["social_brand_voices"].find_one(
+            {"workspace_id": workspace["id"]}
+        )
+        brand_name = voice.get("brand_name") if voice else workspace.get("name", "")
+        industry = voice.get("industry") if voice else ""
 
         seed_row = None
-        if row.system_key:
+        if row.get("system_key"):
             seed_row = next(
-                (r for r in load_social_template_seed_rows() if r.get("id") == row.system_key),
+                (r for r in load_social_template_seed_rows() if r.get("id") == row["system_key"]),
                 None,
             )
         template_source = seed_row or {
-            "captionTemplate": row.caption_template,
-            "imagePrompt": row.image_prompt,
-            "firstCommentTemplate": row.first_comment_template,
-            "suggestedCta": row.suggested_cta,
-            "hashtags": row.hashtags,
-            "name": row.name,
-            "placeholders": row.placeholders,
+            "captionTemplate": row.get("caption_template", ""),
+            "imagePrompt": row.get("image_prompt", ""),
+            "firstCommentTemplate": row.get("first_comment_template", ""),
+            "suggestedCta": row.get("suggested_cta", ""),
+            "hashtags": row.get("hashtags", []),
+            "name": row.get("name", ""),
+            "placeholders": row.get("placeholders", []),
         }
 
         user_values = payload.get("values") or {}
@@ -281,78 +269,72 @@ class SocialPolishService:
             user_values,
             brand_name=brand_name,
             industry=industry,
-            organization_name=workspace.name,
+            organization_name=workspace.get("name", ""),
         )
         resolved = apply_template_fields(template_source, values)
 
         return {
-            "templateId": str(row.id),
-            "name": row.name,
-            "category": row.category,
-            "goal": row.goal,
-            "platforms": list(row.platforms or []),
+            "templateId": str(row["id"]),
+            "name": row.get("name"),
+            "category": row.get("category"),
+            "goal": row.get("goal"),
+            "platforms": list(row.get("platforms") or []),
             "topic": resolved["topic"],
             "captionTemplate": resolved["captionTemplate"],
             "hashtags": resolved["hashtags"],
             "firstComment": resolved["firstComment"],
-            "suggestedTone": row.suggested_tone or "Professional",
-            "suggestedCta": resolved["suggestedCta"] or row.suggested_cta,
-            "generateImage": bool(row.generate_image),
-            "imagePrompt": resolved["imagePrompt"] or row.image_prompt,
+            "suggestedTone": row.get("suggested_tone") or "Professional",
+            "suggestedCta": resolved["suggestedCta"] or row.get("suggested_cta", ""),
+            "generateImage": bool(row.get("generate_image")),
+            "imagePrompt": resolved["imagePrompt"] or row.get("image_prompt", ""),
             "placeholderValues": values,
         }
 
-    def create_template(
-        self,
-        workspace: Workspace,
-        user: User,
-        payload: dict,
-    ) -> dict:
+    def create_template(self, workspace: dict, user: dict, payload: dict) -> dict:
         require_permission(self.db, workspace, user, SocialPermission.EDITOR)
         enforce_templates_limit(self.db, workspace)
-        row = SocialTemplate(
-            id=uuid.uuid4(),
-            workspace_id=workspace.id,
-            name=payload.get("name") or "Untitled",
-            category=payload.get("category") or "general",
-            platforms=list(payload.get("platforms") or []),
-            caption_template=payload.get("captionTemplate") or "",
-            hashtags=list(payload.get("hashtags") or []),
-            description=payload.get("description") or "",
-            goal=payload.get("goal") or "general",
-            placeholders=list(payload.get("placeholders") or []),
-            image_prompt=payload.get("imagePrompt") or "",
-            generate_image=bool(payload.get("generateImage", False)),
-            suggested_tone=payload.get("suggestedTone") or "Professional",
-            suggested_cta=payload.get("suggestedCta") or "",
-            first_comment_template=payload.get("firstCommentTemplate") or "",
-            is_system=False,
-            created_by=user.id,
-        )
-        self.db.add(row)
-        self.db.commit()
+        now = utcnow()
+        doc = {
+            "id": new_id(),
+            "workspace_id": workspace["id"],
+            "name": payload.get("name") or "Untitled",
+            "category": payload.get("category") or "general",
+            "platforms": list(payload.get("platforms") or []),
+            "caption_template": payload.get("captionTemplate") or "",
+            "hashtags": list(payload.get("hashtags") or []),
+            "description": payload.get("description") or "",
+            "goal": payload.get("goal") or "general",
+            "placeholders": list(payload.get("placeholders") or []),
+            "image_prompt": payload.get("imagePrompt") or "",
+            "generate_image": bool(payload.get("generateImage", False)),
+            "suggested_tone": payload.get("suggestedTone") or "Professional",
+            "suggested_cta": payload.get("suggestedCta") or "",
+            "first_comment_template": payload.get("firstCommentTemplate") or "",
+            "is_system": False,
+            "system_key": None,
+            "sort_order": 0,
+            "created_by": user["id"],
+            "created_at": now,
+        }
+        self.db["social_templates"].insert_one(doc)
         write_social_audit(
             self.db,
-            workspace_id=workspace.id,
-            user_id=user.id,
+            workspace_id=workspace["id"],
+            user_id=user["id"],
             action="template.created",
             entity_type="template",
-            entity_id=row.id,
-            commit=True,
+            entity_id=doc["id"],
         )
-        return self._serialize_template(row)
+        return self._serialize_template(doc)
 
     def update_template(
-        self,
-        workspace: Workspace,
-        user: User,
-        template_id: uuid.UUID,
-        payload: dict,
+        self, workspace: dict, user: dict, template_id: str, payload: dict
     ) -> dict:
         require_permission(self.db, workspace, user, SocialPermission.EDITOR)
-        row = self._get_template(workspace.id, template_id)
-        if row.is_system:
+        row = self._get_template(workspace["id"], template_id)
+        if row.get("is_system"):
             raise HTTPException(status_code=400, detail="System templates cannot be edited")
+        updates: dict = {}
         for key, attr in [
             ("name", "name"),
             ("category", "category"),
@@ -369,138 +351,142 @@ class SocialPolishService:
             ("firstCommentTemplate", "first_comment_template"),
         ]:
             if key in payload and payload[key] is not None:
-                setattr(row, attr, payload[key])
-        self.db.commit()
+                updates[attr] = payload[key]
+        if updates:
+            self.db["social_templates"].update_one({"id": template_id}, {"$set": updates})
+        row = self.db["social_templates"].find_one({"id": template_id})
         return self._serialize_template(row)
 
-    def delete_template(
-        self,
-        workspace: Workspace,
-        user: User,
-        template_id: uuid.UUID,
-    ) -> None:
+    def delete_template(self, workspace: dict, user: dict, template_id: str) -> None:
         require_permission(self.db, workspace, user, SocialPermission.EDITOR)
-        row = self._get_template(workspace.id, template_id)
-        if row.is_system:
+        row = self._get_template(workspace["id"], template_id)
+        if row.get("is_system"):
             raise HTTPException(status_code=400, detail="System templates cannot be deleted")
-        self.db.delete(row)
-        self.db.commit()
+        self.db["social_templates"].delete_one({"id": template_id})
 
     # ── Approval ──────────────────────────────────────────────────────────────
 
-    def submit_approval(self, workspace: Workspace, user: User, post: SocialPost) -> SocialPost:
+    def submit_approval(self, workspace: dict, user: dict, post: dict) -> dict:
         require_permission(self.db, workspace, user, SocialPermission.EDITOR)
-        settings = self._settings_row(workspace.id)
-        if not settings.approval_required:
+        settings_row = self._settings_row(workspace["id"])
+        if not settings_row or not settings_row.get("approval_required"):
             raise HTTPException(status_code=400, detail="Approval workflow is disabled")
         enforce_approval_available(self.db, workspace)
-        if post.status not in (SocialPostStatus.DRAFT, SocialPostStatus.FAILED):
+        if post.get("status") not in (SocialPostStatus.DRAFT.value, SocialPostStatus.FAILED.value):
             raise HTTPException(status_code=400, detail="Only drafts can be submitted")
-        post.status = SocialPostStatus.PENDING_APPROVAL
-        post.approval_status = SocialApprovalStatus.PENDING
-        self.db.commit()
+        self.db["social_posts"].update_one(
+            {"id": post["id"]},
+            {
+                "$set": {
+                    "status": SocialPostStatus.PENDING_APPROVAL.value,
+                    "approval_status": SocialApprovalStatus.PENDING.value,
+                }
+            },
+        )
+        post = self.db["social_posts"].find_one({"id": post["id"]})
         write_social_audit(
             self.db,
-            workspace_id=workspace.id,
-            user_id=user.id,
+            workspace_id=workspace["id"],
+            user_id=user["id"],
             action="post.submitted_approval",
-            entity_id=post.id,
-            commit=True,
+            entity_id=post["id"],
         )
-        self.db.refresh(post)
         return post
 
-    def approve_post(self, workspace: Workspace, user: User, post: SocialPost) -> SocialPost:
+    def approve_post(self, workspace: dict, user: dict, post: dict) -> dict:
         require_permission(self.db, workspace, user, SocialPermission.ADMIN)
-        if post.status != SocialPostStatus.PENDING_APPROVAL:
+        if post.get("status") != SocialPostStatus.PENDING_APPROVAL.value:
             raise HTTPException(status_code=400, detail="Post is not pending approval")
-        post.approval_status = SocialApprovalStatus.APPROVED
-        post.approved_by = user.id
-        post.status = SocialPostStatus.DRAFT
-        self.db.commit()
+        self.db["social_posts"].update_one(
+            {"id": post["id"]},
+            {
+                "$set": {
+                    "approval_status": SocialApprovalStatus.APPROVED.value,
+                    "approved_by": user["id"],
+                    "status": SocialPostStatus.DRAFT.value,
+                }
+            },
+        )
+        post = self.db["social_posts"].find_one({"id": post["id"]})
         write_social_audit(
             self.db,
-            workspace_id=workspace.id,
-            user_id=user.id,
+            workspace_id=workspace["id"],
+            user_id=user["id"],
             action="post.approved",
-            entity_id=post.id,
-            commit=True,
+            entity_id=post["id"],
         )
-        self.db.refresh(post)
         return post
 
     def reject_post(
-        self,
-        workspace: Workspace,
-        user: User,
-        post: SocialPost,
-        reason: Optional[str] = None,
-    ) -> SocialPost:
+        self, workspace: dict, user: dict, post: dict, reason: Optional[str] = None
+    ) -> dict:
         require_permission(self.db, workspace, user, SocialPermission.ADMIN)
-        if post.status != SocialPostStatus.PENDING_APPROVAL:
+        if post.get("status") != SocialPostStatus.PENDING_APPROVAL.value:
             raise HTTPException(status_code=400, detail="Post is not pending approval")
-        post.approval_status = SocialApprovalStatus.REJECTED
-        post.approved_by = user.id
-        post.status = SocialPostStatus.DRAFT
-        self.db.commit()
+        self.db["social_posts"].update_one(
+            {"id": post["id"]},
+            {
+                "$set": {
+                    "approval_status": SocialApprovalStatus.REJECTED.value,
+                    "approved_by": user["id"],
+                    "status": SocialPostStatus.DRAFT.value,
+                }
+            },
+        )
+        post = self.db["social_posts"].find_one({"id": post["id"]})
         write_social_audit(
             self.db,
-            workspace_id=workspace.id,
-            user_id=user.id,
+            workspace_id=workspace["id"],
+            user_id=user["id"],
             action="post.rejected",
-            entity_id=post.id,
+            entity_id=post["id"],
             metadata={"reason": reason},
-            commit=True,
         )
-        self.db.refresh(post)
         return post
 
     def request_changes(
-        self,
-        workspace: Workspace,
-        user: User,
-        post: SocialPost,
-        reason: Optional[str] = None,
-    ) -> SocialPost:
+        self, workspace: dict, user: dict, post: dict, reason: Optional[str] = None
+    ) -> dict:
         require_permission(self.db, workspace, user, SocialPermission.ADMIN)
-        if post.status != SocialPostStatus.PENDING_APPROVAL:
+        if post.get("status") != SocialPostStatus.PENDING_APPROVAL.value:
             raise HTTPException(status_code=400, detail="Post is not pending approval")
-        post.approval_status = SocialApprovalStatus.CHANGES_REQUESTED
-        post.approved_by = user.id
-        post.status = SocialPostStatus.DRAFT
-        self.db.commit()
+        self.db["social_posts"].update_one(
+            {"id": post["id"]},
+            {
+                "$set": {
+                    "approval_status": SocialApprovalStatus.CHANGES_REQUESTED.value,
+                    "approved_by": user["id"],
+                    "status": SocialPostStatus.DRAFT.value,
+                }
+            },
+        )
+        post = self.db["social_posts"].find_one({"id": post["id"]})
         write_social_audit(
             self.db,
-            workspace_id=workspace.id,
-            user_id=user.id,
+            workspace_id=workspace["id"],
+            user_id=user["id"],
             action="post.changes_requested",
-            entity_id=post.id,
+            entity_id=post["id"],
             metadata={"reason": reason},
-            commit=True,
         )
-        self.db.refresh(post)
         return post
 
     # ── Dashboard ─────────────────────────────────────────────────────────────
 
-    def dashboard_stats(self, workspace: Workspace) -> dict:
-        accounts = self.db.scalars(
-            select(SocialAccount).where(
-                SocialAccount.workspace_id == workspace.id,
-                SocialAccount.is_active.is_(True),
+    def dashboard_stats(self, workspace: dict) -> dict:
+        accounts = list(
+            self.db["social_accounts"].find(
+                {"workspace_id": workspace["id"], "is_active": True}
             )
-        ).all()
+        )
         week_ago = datetime.now(timezone.utc) - timedelta(days=7)
-        posts_week = self.db.scalar(
-            select(func.count()).select_from(SocialPost).where(
-                SocialPost.workspace_id == workspace.id,
-                SocialPost.created_at >= week_ago,
-            )
-        ) or 0
+        posts_week = self.db["social_posts"].count_documents(
+            {"workspace_id": workspace["id"], "created_at": {"$gte": week_ago}}
+        )
         from app.social.analytics.aggregator import AnalyticsAggregator
 
         overview = AnalyticsAggregator(self.db).overview(
-            workspace.id,
+            workspace["id"],
             (datetime.now(timezone.utc) - timedelta(days=29)).date().isoformat(),
             datetime.now(timezone.utc).date().isoformat(),
         )
@@ -508,8 +494,12 @@ class SocialPolishService:
         expired = sum(
             1
             for a in accounts
-            if a.token_expires_at
-            and a.token_expires_at.replace(tzinfo=timezone.utc)
+            if a.get("token_expires_at")
+            and (
+                a["token_expires_at"].replace(tzinfo=timezone.utc)
+                if a["token_expires_at"].tzinfo is None
+                else a["token_expires_at"]
+            )
             <= datetime.now(timezone.utc)
         )
         return {
@@ -521,67 +511,63 @@ class SocialPolishService:
             "usage": usage_snapshot(self.db, workspace),
             "accounts": [
                 {
-                    "id": str(a.id),
-                    "platform": a.platform.value,
-                    "accountName": a.account_name,
-                    "followerCount": a.follower_count,
+                    "id": str(a["id"]),
+                    "platform": a.get("platform"),
+                    "accountName": a.get("account_name"),
+                    "followerCount": a.get("follower_count"),
                     "tokenStatus": self._token_status(a),
-                    "isDefault": a.is_default,
+                    "isDefault": a.get("is_default"),
                 }
                 for a in accounts
             ],
         }
 
-    def activity(self, workspace: Workspace, limit: int = 10) -> list[dict]:
-        rows = self.db.scalars(
-            select(SocialAuditLog)
-            .where(SocialAuditLog.workspace_id == workspace.id)
-            .order_by(SocialAuditLog.created_at.desc())
+    def activity(self, workspace: dict, limit: int = 10) -> list[dict]:
+        rows = list(
+            self.db["social_audit_logs"]
+            .find({"workspace_id": workspace["id"]})
+            .sort("created_at", -1)
             .limit(limit)
-        ).all()
+        )
         if rows:
             post_ids = [
-                r.entity_id
+                r["entity_id"]
                 for r in rows
-                if r.entity_type == "post" and r.entity_id is not None
+                if r.get("entity_type") == "post" and r.get("entity_id")
             ]
-            title_by_post_id: dict[uuid.UUID, str] = {}
+            title_by_post_id: dict[str, str] = {}
             if post_ids:
-                for post_id, title in self.db.execute(
-                    select(SocialPost.id, SocialPost.title).where(
-                        SocialPost.id.in_(post_ids)
-                    )
-                ).all():
-                    title_by_post_id[post_id] = title
+                for post in self.db["social_posts"].find({"id": {"$in": post_ids}}):
+                    title_by_post_id[post["id"]] = post.get("title", "")
 
             return [
                 self._serialize_activity_item(
-                    id=str(r.id),
-                    action=r.action,
-                    entity_type=r.entity_type,
-                    entity_id=str(r.entity_id) if r.entity_id else None,
-                    metadata=r.metadata_json or {},
-                    created_at=r.created_at,
+                    id=str(r["id"]),
+                    action=r.get("action", ""),
+                    entity_type=r.get("entity_type", "post"),
+                    entity_id=r.get("entity_id"),
+                    metadata=r.get("metadata_json") or {},
+                    created_at=r.get("created_at"),
                     title_lookup=title_by_post_id,
                 )
                 for r in rows
             ]
+
         # Fallback: recent posts status changes
-        posts = self.db.scalars(
-            select(SocialPost)
-            .options(selectinload(SocialPost.platforms))
-            .where(SocialPost.workspace_id == workspace.id)
-            .order_by(SocialPost.updated_at.desc())
+        posts = list(
+            self.db["social_posts"]
+            .find({"workspace_id": workspace["id"]})
+            .sort("updated_at", -1)
             .limit(limit)
-        ).all()
+        )
         return [
             self._serialize_activity_item(
-                id=str(p.id),
-                action=f"post.{p.status.value}",
+                id=str(p["id"]),
+                action=f"post.{p.get('status', 'draft')}",
                 entity_type="post",
-                entity_id=str(p.id),
-                metadata={"title": p.title},
-                created_at=p.updated_at,
+                entity_id=str(p["id"]),
+                metadata={"title": p.get("title", "")},
+                created_at=p.get("updated_at"),
             )
             for p in posts
         ]
@@ -608,15 +594,12 @@ class SocialPolishService:
         action: str,
         entity_type: str,
         metadata: dict[str, Any],
-        title_lookup: Optional[dict[uuid.UUID, str]] = None,
+        title_lookup: Optional[dict[str, str]] = None,
         entity_id: Optional[str] = None,
     ) -> str:
         title = (metadata.get("title") or metadata.get("name") or "").strip()
         if not title and entity_type == "post" and entity_id and title_lookup:
-            try:
-                title = (title_lookup.get(uuid.UUID(entity_id)) or "").strip()
-            except ValueError:
-                title = ""
+            title = (title_lookup.get(entity_id) or "").strip()
         quoted = f" '{title}'" if title else ""
 
         labels = {
@@ -655,7 +638,7 @@ class SocialPolishService:
         entity_id: Optional[str],
         metadata: dict[str, Any],
         created_at: Optional[datetime],
-        title_lookup: Optional[dict[uuid.UUID, str]] = None,
+        title_lookup: Optional[dict[str, str]] = None,
     ) -> dict:
         return {
             "id": id,
@@ -674,14 +657,12 @@ class SocialPolishService:
             "createdAt": created_at.isoformat() if created_at else None,
         }
 
-    def recommendations(self, workspace: Workspace) -> list[dict]:
-        from app.social.models import SocialBrandVoice
-
-        voice = self.db.scalars(
-            select(SocialBrandVoice).where(SocialBrandVoice.workspace_id == workspace.id)
-        ).first()
-        brand = voice.brand_name if voice else workspace.name
-        industry = voice.industry if voice else "your industry"
+    def recommendations(self, workspace: dict) -> list[dict]:
+        voice = self.db["social_brand_voices"].find_one(
+            {"workspace_id": workspace["id"]}
+        )
+        brand = voice.get("brand_name") if voice else workspace.get("name", "your brand")
+        industry = voice.get("industry") if voice else "your industry"
         day = datetime.now(timezone.utc).strftime("%A")
         return [
             {
@@ -700,94 +681,127 @@ class SocialPolishService:
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
-    def _settings_row(self, workspace_id: uuid.UUID, create: bool = True) -> SocialSettings:
-        row = self.db.scalars(
-            select(SocialSettings).where(SocialSettings.workspace_id == workspace_id)
-        ).first()
-        if row or not create:
-            if not row:
-                # ephemeral defaults
-                return SocialSettings(
-                    id=uuid.uuid4(),
-                    workspace_id=workspace_id,
-                    default_posting_times=DEFAULT_POSTING_TIMES,
-                    enabled_platforms=DEFAULT_ENABLED_PLATFORMS,
-                    notification_events=DEFAULT_NOTIFICATION_EVENTS,
-                )
+    def _settings_row(self, workspace_id: str, create: bool = True) -> dict | None:
+        row = self.db["social_settings"].find_one({"workspace_id": str(workspace_id)})
+        if row:
             return row
-        row = SocialSettings(
-            id=uuid.uuid4(),
-            workspace_id=workspace_id,
-            default_posting_times=dict(DEFAULT_POSTING_TIMES),
-            enabled_platforms=dict(DEFAULT_ENABLED_PLATFORMS),
-            notification_events=dict(DEFAULT_NOTIFICATION_EVENTS),
-        )
-        self.db.add(row)
-        self.db.flush()
-        return row
+        if not create:
+            # Return ephemeral defaults dict
+            return {
+                "id": new_id(),
+                "workspace_id": str(workspace_id),
+                "timezone": "Asia/Kolkata",
+                "default_language": "en",
+                "approval_required": False,
+                "approver_user_ids": [],
+                "approval_sla_hours": 24,
+                "approval_sla_action": "none",
+                "default_posting_times": DEFAULT_POSTING_TIMES,
+                "queue_gap_minutes": 30,
+                "blackout_dates": [],
+                "default_tone": "Professional",
+                "default_cta": "",
+                "hashtag_count": 5,
+                "auto_first_comment": False,
+                "image_generation_style": "Photographic",
+                "openai_model": "gpt-4o-mini",
+                "system_prompt_override": None,
+                "enabled_platforms": DEFAULT_ENABLED_PLATFORMS,
+                "notification_events": DEFAULT_NOTIFICATION_EVENTS,
+                "notification_delivery": "in_app",
+            }
+        now = utcnow()
+        doc = {
+            "id": new_id(),
+            "workspace_id": str(workspace_id),
+            "timezone": "Asia/Kolkata",
+            "default_language": "en",
+            "approval_required": False,
+            "approver_user_ids": [],
+            "approval_sla_hours": 24,
+            "approval_sla_action": "none",
+            "default_posting_times": dict(DEFAULT_POSTING_TIMES),
+            "queue_gap_minutes": 30,
+            "blackout_dates": [],
+            "default_tone": "Professional",
+            "default_cta": "",
+            "hashtag_count": 5,
+            "auto_first_comment": False,
+            "image_generation_style": "Photographic",
+            "openai_model": "gpt-4o-mini",
+            "system_prompt_override": None,
+            "enabled_platforms": dict(DEFAULT_ENABLED_PLATFORMS),
+            "notification_events": dict(DEFAULT_NOTIFICATION_EVENTS),
+            "notification_delivery": "in_app",
+            "updated_at": now,
+        }
+        self.db["social_settings"].insert_one(doc)
+        return doc
 
-    def _serialize_settings(self, row: SocialSettings, workspace: Workspace) -> dict:
+    def _serialize_settings(self, row: dict | None, workspace: dict) -> dict:
+        r = row or {}
         return {
-            "id": str(row.id) if row.id else None,
-            "workspaceId": str(workspace.id),
-            "timezone": row.timezone or "Asia/Kolkata",
-            "defaultLanguage": row.default_language or "en",
-            "approvalRequired": bool(row.approval_required),
-            "approverUserIds": list(row.approver_user_ids or []),
-            "approvalSlaHours": row.approval_sla_hours or 24,
-            "approvalSlaAction": row.approval_sla_action or "none",
-            "defaultPostingTimes": row.default_posting_times or DEFAULT_POSTING_TIMES,
-            "queueGapMinutes": row.queue_gap_minutes or 30,
-            "blackoutDates": list(row.blackout_dates or []),
-            "defaultTone": row.default_tone or "Professional",
-            "defaultCta": row.default_cta or "",
-            "hashtagCount": row.hashtag_count or 5,
-            "autoFirstComment": bool(row.auto_first_comment),
-            "imageGenerationStyle": row.image_generation_style or "Photographic",
-            "openaiModel": row.openai_model or "gpt-4o-mini",
-            "systemPromptOverride": row.system_prompt_override,
-            "enabledPlatforms": row.enabled_platforms or DEFAULT_ENABLED_PLATFORMS,
-            "notificationEvents": row.notification_events or DEFAULT_NOTIFICATION_EVENTS,
-            "notificationDelivery": row.notification_delivery or "in_app",
+            "id": str(r.get("id")) if r.get("id") else None,
+            "workspaceId": str(workspace["id"]),
+            "timezone": r.get("timezone") or "Asia/Kolkata",
+            "defaultLanguage": r.get("default_language") or "en",
+            "approvalRequired": bool(r.get("approval_required")),
+            "approverUserIds": list(r.get("approver_user_ids") or []),
+            "approvalSlaHours": r.get("approval_sla_hours") or 24,
+            "approvalSlaAction": r.get("approval_sla_action") or "none",
+            "defaultPostingTimes": r.get("default_posting_times") or DEFAULT_POSTING_TIMES,
+            "queueGapMinutes": r.get("queue_gap_minutes") or 30,
+            "blackoutDates": list(r.get("blackout_dates") or []),
+            "defaultTone": r.get("default_tone") or "Professional",
+            "defaultCta": r.get("default_cta") or "",
+            "hashtagCount": r.get("hashtag_count") or 5,
+            "autoFirstComment": bool(r.get("auto_first_comment")),
+            "imageGenerationStyle": r.get("image_generation_style") or "Photographic",
+            "openaiModel": r.get("openai_model") or "gpt-4o-mini",
+            "systemPromptOverride": r.get("system_prompt_override"),
+            "enabledPlatforms": r.get("enabled_platforms") or DEFAULT_ENABLED_PLATFORMS,
+            "notificationEvents": r.get("notification_events") or DEFAULT_NOTIFICATION_EVENTS,
+            "notificationDelivery": r.get("notification_delivery") or "in_app",
             "usage": usage_snapshot(self.db, workspace),
         }
 
-    def _get_template(self, workspace_id: uuid.UUID, template_id: uuid.UUID) -> SocialTemplate:
-        row = self.db.get(SocialTemplate, template_id)
-        if not row or row.workspace_id != workspace_id:
+    def _get_template(self, workspace_id: str, template_id: str) -> dict:
+        row = self.db["social_templates"].find_one({"id": str(template_id)})
+        if not row or row.get("workspace_id") != workspace_id:
             raise HTTPException(status_code=404, detail="Template not found")
         return row
 
-    def _serialize_template(self, row: SocialTemplate) -> dict:
+    def _serialize_template(self, row: dict) -> dict:
         return {
-            "id": str(row.id),
-            "workspaceId": str(row.workspace_id),
-            "name": row.name,
-            "category": row.category,
-            "platforms": list(row.platforms or []),
-            "captionTemplate": row.caption_template,
-            "hashtags": list(row.hashtags or []),
-            "isSystem": bool(row.is_system),
-            "systemKey": row.system_key,
-            "description": row.description or "",
-            "goal": row.goal or "general",
-            "placeholders": list(row.placeholders or []),
-            "imagePrompt": row.image_prompt or "",
-            "generateImage": bool(row.generate_image),
-            "suggestedTone": row.suggested_tone or "Professional",
-            "suggestedCta": row.suggested_cta or "",
-            "firstCommentTemplate": row.first_comment_template or "",
-            "sortOrder": row.sort_order or 0,
-            "createdBy": str(row.created_by) if row.created_by else None,
-            "createdAt": row.created_at.isoformat() if row.created_at else None,
+            "id": str(row["id"]),
+            "workspaceId": str(row.get("workspace_id")),
+            "name": row.get("name"),
+            "category": row.get("category"),
+            "platforms": list(row.get("platforms") or []),
+            "captionTemplate": row.get("caption_template"),
+            "hashtags": list(row.get("hashtags") or []),
+            "isSystem": bool(row.get("is_system")),
+            "systemKey": row.get("system_key"),
+            "description": row.get("description") or "",
+            "goal": row.get("goal") or "general",
+            "placeholders": list(row.get("placeholders") or []),
+            "imagePrompt": row.get("image_prompt") or "",
+            "generateImage": bool(row.get("generate_image")),
+            "suggestedTone": row.get("suggested_tone") or "Professional",
+            "suggestedCta": row.get("suggested_cta") or "",
+            "firstCommentTemplate": row.get("first_comment_template") or "",
+            "sortOrder": row.get("sort_order") or 0,
+            "createdBy": str(row["created_by"]) if row.get("created_by") else None,
+            "createdAt": row["created_at"].isoformat() if row.get("created_at") else None,
         }
 
-    def _token_status(self, account: SocialAccount) -> str:
-        if not account.is_active or not account.access_token_enc:
+    def _token_status(self, account: dict) -> str:
+        if not account.get("is_active") or not account.get("access_token_enc"):
             return "disconnected"
-        if not account.token_expires_at:
+        token_expires_at = account.get("token_expires_at")
+        if not token_expires_at:
             return "active"
-        expires = account.token_expires_at
+        expires = token_expires_at
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)

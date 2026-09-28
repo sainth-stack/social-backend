@@ -3,25 +3,16 @@
 from __future__ import annotations
 
 import logging
-import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session, selectinload
+from pymongo.database import Database
 
 from app.core.config import settings
 from app.core.encryption import decrypt
-from app.social.models import (
-    SocialAccount,
-    SocialAnalyticsDaily,
-    SocialPlatform,
-    SocialPlatformPostStatus,
-    SocialPost,
-    SocialPostPlatform,
-    SocialPostStatus,
-)
+from app.core.mongo_utils import new_id, utcnow
+from app.social.models import SocialPlatform, SocialPlatformPostStatus
 from app.social.oauth.base import get_oauth_handler
 
 logger = logging.getLogger(__name__)
@@ -31,107 +22,118 @@ def _utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
-def _engagement(pp: SocialPostPlatform) -> int:
-    return int(pp.likes or 0) + int(pp.comments or 0) + int(pp.shares or 0)
+def _engagement(pp: dict) -> int:
+    return int(pp.get("likes") or 0) + int(pp.get("comments") or 0) + int(pp.get("shares") or 0)
 
 
-def sync_account_daily(db: Session, account: SocialAccount, day: Optional[date] = None) -> SocialAnalyticsDaily:
+def sync_account_daily(
+    db: Database, account: dict, day: Optional[date] = None
+) -> dict:
     """Upsert today's analytics row for one account from posts + follower sync."""
     day = day or _utc_today()
     start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
     end = start + timedelta(days=1)
 
-    follower_count = account.follower_count or 0
-    if account.access_token_enc:
+    follower_count = int(account.get("follower_count") or 0)
+    if account.get("access_token_enc"):
         try:
-            token = decrypt(account.access_token_enc)
-            handler = get_oauth_handler(account.platform)
-            stats = handler.sync_account_stats(account.platform_account_id, token)
+            token = decrypt(account["access_token_enc"])
+            handler = get_oauth_handler(SocialPlatform(account["platform"]))
+            stats = handler.sync_account_stats(account["platform_account_id"], token)
             if stats.get("follower_count") is not None:
                 follower_count = int(stats["follower_count"])
-                account.follower_count = follower_count
+                db["social_accounts"].update_one(
+                    {"id": account["id"]}, {"$set": {"follower_count": follower_count}}
+                )
+            updates: dict = {}
             if stats.get("account_name"):
-                account.account_name = stats["account_name"]
+                updates["account_name"] = stats["account_name"]
             if stats.get("account_picture_url") is not None:
-                account.account_picture_url = stats["account_picture_url"]
-            account.last_synced_at = datetime.now(timezone.utc)
+                updates["account_picture_url"] = stats["account_picture_url"]
+            updates["last_synced_at"] = utcnow()
+            db["social_accounts"].update_one({"id": account["id"]}, {"$set": updates})
+            account = db["social_accounts"].find_one({"id": account["id"]})
         except Exception as exc:
-            logger.warning("Follower sync failed for account %s: %s", account.id, exc)
+            logger.warning("Follower sync failed for account %s: %s", account["id"], exc)
 
     # Previous day follower count for new_followers
-    prev = db.scalars(
-        select(SocialAnalyticsDaily).where(
-            SocialAnalyticsDaily.social_account_id == account.id,
-            SocialAnalyticsDaily.date == day - timedelta(days=1),
-        )
-    ).first()
-    prev_followers = prev.follower_count if prev else follower_count
+    prev_day = (datetime.combine(day, datetime.min.time()) - timedelta(days=1)).date()
+    prev = db["social_analytics_daily"].find_one(
+        {"social_account_id": account["id"], "date": prev_day}
+    )
+    prev_followers = int(prev.get("follower_count") or follower_count) if prev else follower_count
     new_followers = max(0, follower_count - prev_followers)
 
-    platforms = db.scalars(
-        select(SocialPostPlatform)
-        .join(SocialPost, SocialPost.id == SocialPostPlatform.post_id)
-        .where(
-            SocialPostPlatform.social_account_id == account.id,
-            SocialPostPlatform.status == SocialPlatformPostStatus.PUBLISHED,
-            SocialPostPlatform.published_at.is_not(None),
-            SocialPostPlatform.published_at >= start,
-            SocialPostPlatform.published_at < end,
+    # Get published platforms in this day window
+    post_ids = [
+        p["id"]
+        for p in db["social_posts"].find({"workspace_id": account["workspace_id"]})
+    ]
+    platforms = list(
+        db["social_post_platforms"].find(
+            {
+                "social_account_id": account["id"],
+                "status": SocialPlatformPostStatus.PUBLISHED.value,
+                "published_at": {"$gte": start, "$lt": end},
+            }
         )
-    ).all()
+    )
 
     posts_count = len(platforms)
-    total_reach = sum(int(p.reach or 0) for p in platforms)
-    total_impressions = sum(int(p.impressions or 0) for p in platforms)
+    total_reach = sum(int(p.get("reach") or 0) for p in platforms)
+    total_impressions = sum(int(p.get("impressions") or 0) for p in platforms)
     total_engagements = sum(_engagement(p) for p in platforms)
-    total_clicks = sum(int(p.clicks or 0) for p in platforms)
+    total_clicks = sum(int(p.get("clicks") or 0) for p in platforms)
 
-    row = db.scalars(
-        select(SocialAnalyticsDaily).where(
-            SocialAnalyticsDaily.social_account_id == account.id,
-            SocialAnalyticsDaily.date == day,
-        )
-    ).first()
+    row = db["social_analytics_daily"].find_one(
+        {"social_account_id": account["id"], "date": day}
+    )
+
+    update_doc = {
+        "workspace_id": account["workspace_id"],
+        "social_account_id": account["id"],
+        "platform": account["platform"],
+        "date": day,
+        "follower_count": follower_count,
+        "new_followers": new_followers,
+        "posts_count": posts_count,
+        "total_reach": total_reach,
+        "total_impressions": total_impressions,
+        "total_engagements": total_engagements,
+        "total_clicks": total_clicks,
+    }
+
     if not row:
-        row = SocialAnalyticsDaily(
-            id=uuid.uuid4(),
-            workspace_id=account.workspace_id,
-            social_account_id=account.id,
-            platform=account.platform,
-            date=day,
+        update_doc["id"] = new_id()
+        db["social_analytics_daily"].insert_one(update_doc)
+        return update_doc
+    else:
+        db["social_analytics_daily"].update_one(
+            {"social_account_id": account["id"], "date": day}, {"$set": update_doc}
         )
-        db.add(row)
-
-    row.follower_count = follower_count
-    row.new_followers = new_followers
-    row.posts_count = posts_count
-    row.total_reach = total_reach
-    row.total_impressions = total_impressions
-    row.total_engagements = total_engagements
-    row.total_clicks = total_clicks
-    db.flush()
-    return row
-
-
-def sync_org_platform_analytics(db: Session, workspace_id: uuid.UUID, day: Optional[date] = None) -> int:
-    accounts = db.scalars(
-        select(SocialAccount).where(
-            SocialAccount.workspace_id == workspace_id,
-            SocialAccount.is_active.is_(True),
+        return db["social_analytics_daily"].find_one(
+            {"social_account_id": account["id"], "date": day}
         )
-    ).all()
+
+
+def sync_org_platform_analytics(
+    db: Database, workspace_id: str, day: Optional[date] = None
+) -> int:
+    accounts = list(
+        db["social_accounts"].find({"workspace_id": str(workspace_id), "is_active": True})
+    )
     count = 0
     for account in accounts:
         sync_account_daily(db, account, day=day)
         count += 1
-    db.commit()
     return count
 
 
-def sync_all_orgs_platform_analytics(db: Session) -> int:
-    org_ids = db.scalars(select(SocialAccount.workspace_id).distinct()).all()
+def sync_all_orgs_platform_analytics(db: Database) -> int:
+    pipeline = [{"$group": {"_id": "$workspace_id"}}]
+    workspace_ids = [row["_id"] for row in db["social_accounts"].aggregate(pipeline)]
     total = 0
-    for workspace_id in org_ids:
+    for workspace_id in workspace_ids:
         total += sync_org_platform_analytics(db, workspace_id)
     return total
 
@@ -151,7 +153,6 @@ def _fetch_facebook_post_metrics(platform_post_id: str, token: str) -> dict:
     likes = int((data.get("likes") or {}).get("summary", {}).get("total_count") or 0)
     comments = int((data.get("comments") or {}).get("summary", {}).get("total_count") or 0)
     shares = int((data.get("shares") or {}).get("count") or 0)
-    # Insights (may require permissions)
     insights_url = f"https://graph.facebook.com/{api}/{platform_post_id}/insights"
     reach = impressions = clicks = 0
     try:
@@ -171,8 +172,6 @@ def _fetch_facebook_post_metrics(platform_post_id: str, token: str) -> dict:
                     if name == "post_impressions":
                         impressions = val
                         reach = max(reach, val)
-                    elif name == "post_engaged_users":
-                        pass
                     elif name == "post_clicks":
                         clicks = val
     except Exception:
@@ -191,7 +190,6 @@ def _fetch_facebook_post_metrics(platform_post_id: str, token: str) -> dict:
 
 def _fetch_instagram_post_metrics(platform_post_id: str, token: str) -> dict:
     api = settings.meta_api_version
-    # Instagram Login tokens are valid on graph.instagram.com.
     url = f"https://graph.instagram.com/{api}/{platform_post_id}/insights"
     params = {
         "metric": "impressions,reach,likes,comments,shares,saved",
@@ -226,53 +224,60 @@ def _fetch_instagram_post_metrics(platform_post_id: str, token: str) -> dict:
     }
 
 
-def sync_recent_post_metrics(db: Session, days: int = 7) -> int:
+def sync_recent_post_metrics(db: Database, days: int = 7) -> int:
     """Refresh metrics for posts published in the last N days."""
     since = datetime.now(timezone.utc) - timedelta(days=days)
-    rows = db.scalars(
-        select(SocialPostPlatform)
-        .options(selectinload(SocialPostPlatform.social_account))
-        .where(
-            SocialPostPlatform.status == SocialPlatformPostStatus.PUBLISHED,
-            SocialPostPlatform.platform_post_id.is_not(None),
-            SocialPostPlatform.published_at.is_not(None),
-            SocialPostPlatform.published_at >= since,
+    rows = list(
+        db["social_post_platforms"].find(
+            {
+                "status": SocialPlatformPostStatus.PUBLISHED.value,
+                "platform_post_id": {"$ne": None},
+                "published_at": {"$gte": since},
+            }
         )
-    ).all()
+    )
 
     updated = 0
     for pp in rows:
-        account = pp.social_account
-        if not account or not account.access_token_enc or not pp.platform_post_id:
+        account = db["social_accounts"].find_one({"id": pp.get("social_account_id")})
+        if not account or not account.get("access_token_enc") or not pp.get("platform_post_id"):
             continue
-        token = decrypt(account.access_token_enc)
+        token = decrypt(account["access_token_enc"])
         metrics: dict = {}
         try:
-            if pp.platform == SocialPlatform.FACEBOOK:
-                metrics = _fetch_facebook_post_metrics(pp.platform_post_id, token)
-            elif pp.platform == SocialPlatform.INSTAGRAM:
-                metrics = _fetch_instagram_post_metrics(pp.platform_post_id, token)
-            # LinkedIn / X: limited free-tier insights — leave stored values
+            platform = pp.get("platform", "")
+            if platform == SocialPlatform.FACEBOOK.value:
+                metrics = _fetch_facebook_post_metrics(pp["platform_post_id"], token)
+            elif platform == SocialPlatform.INSTAGRAM.value:
+                metrics = _fetch_instagram_post_metrics(pp["platform_post_id"], token)
         except Exception as exc:
-            logger.warning("Post metrics sync failed for %s: %s", pp.id, exc)
+            logger.warning("Post metrics sync failed for %s: %s", pp.get("id"), exc)
             continue
 
         if not metrics:
-            # Fallback: derive engagement_rate from existing counters
             eng = _engagement(pp)
-            impressions = pp.impressions or pp.reach or 0
-            if impressions and not pp.engagement_rate:
-                pp.engagement_rate = round(eng / impressions, 4)
+            impressions = pp.get("impressions") or pp.get("reach") or 0
+            if impressions and not pp.get("engagement_rate"):
+                db["social_post_platforms"].update_one(
+                    {"id": pp["id"]},
+                    {"$set": {"engagement_rate": round(eng / impressions, 4)}},
+                )
             continue
 
-        pp.likes = metrics.get("likes", pp.likes)
-        pp.comments = metrics.get("comments", pp.comments)
-        pp.shares = metrics.get("shares", pp.shares)
-        pp.reach = metrics.get("reach", pp.reach)
-        pp.impressions = metrics.get("impressions", pp.impressions)
-        pp.clicks = metrics.get("clicks", pp.clicks)
-        pp.engagement_rate = metrics.get("engagement_rate", pp.engagement_rate)
+        db["social_post_platforms"].update_one(
+            {"id": pp["id"]},
+            {
+                "$set": {
+                    "likes": metrics.get("likes", pp.get("likes")),
+                    "comments": metrics.get("comments", pp.get("comments")),
+                    "shares": metrics.get("shares", pp.get("shares")),
+                    "reach": metrics.get("reach", pp.get("reach")),
+                    "impressions": metrics.get("impressions", pp.get("impressions")),
+                    "clicks": metrics.get("clicks", pp.get("clicks")),
+                    "engagement_rate": metrics.get("engagement_rate", pp.get("engagement_rate")),
+                }
+            },
+        )
         updated += 1
 
-    db.commit()
     return updated

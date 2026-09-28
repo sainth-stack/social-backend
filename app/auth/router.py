@@ -4,8 +4,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from app.auth.deps import get_current_user
 from app.auth.google import build_google_auth_url, complete_google_sign_in
@@ -31,9 +30,8 @@ from app.auth.service import (
 )
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.mongo_utils import public_doc
 from app.core.rate_limit import enforce_rate_limit
-from app.users.models import User
-from app.workspaces.models import WorkspaceMember
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -42,20 +40,20 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 def register(
     payload: RegisterRequest,
     request: Request,
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ) -> RegisterResponse:
     enforce_rate_limit(request, key_prefix="auth_register", limit=10, window_seconds=3600)
     user, workspace, membership = register_user(db, payload)
     token = issue_token_for_user(user)
     return RegisterResponse(
         access_token=token,
-        user=UserOut.model_validate(user),
+        user=UserOut.model_validate(public_doc(user)),
         workspace=WorkspaceSummaryOut(
-            id=workspace.id,
-            name=workspace.name,
-            plan=workspace.plan.value,
-            role=membership.role.value,
-            social_level=membership.social_level.value,
+            id=workspace["id"],
+            name=workspace["name"],
+            plan=workspace["plan"],
+            role=membership["role"],
+            social_level=membership["social_level"],
         ),
     )
 
@@ -64,7 +62,7 @@ def register(
 def login(
     payload: LoginRequest,
     request: Request,
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ) -> TokenResponse:
     enforce_rate_limit(request, key_prefix="auth_login", limit=30, window_seconds=900)
     user = authenticate_user(db, payload)
@@ -76,7 +74,7 @@ def login(
 def forgot_password(
     payload: ForgotPasswordRequest,
     request: Request,
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ) -> ForgotPasswordResponse:
     enforce_rate_limit(request, key_prefix="auth_forgot", limit=10, window_seconds=3600)
     request_password_reset(db, payload.email)
@@ -87,7 +85,7 @@ def forgot_password(
 def reset_password_endpoint(
     payload: ResetPasswordRequest,
     request: Request,
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ) -> ResetPasswordResponse:
     enforce_rate_limit(request, key_prefix="auth_reset", limit=20, window_seconds=3600)
     reset_password(db, payload.token, payload.password)
@@ -103,7 +101,7 @@ def google_auth_url() -> dict[str, str]:
 def google_auth_callback(
     code: str = Query(...),
     state: str = Query(...),
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ) -> RedirectResponse:
     frontend = settings.frontend_url.rstrip("/")
     try:
@@ -115,21 +113,22 @@ def google_auth_callback(
 
 
 @router.get("/me", response_model=MeResponse)
-def me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> MeResponse:
-    stmt = (
-        select(WorkspaceMember)
-        .where(WorkspaceMember.user_id == current_user.id)
-        .join(WorkspaceMember.workspace)
-    )
-    memberships = db.execute(stmt).scalars().all()
-    workspaces = [
+def me(current_user: dict = Depends(get_current_user), db: Database = Depends(get_db)) -> MeResponse:
+    memberships = list(db["workspace_members"].find({"user_id": current_user["id"]}))
+    workspace_ids = [m["workspace_id"] for m in memberships]
+    workspaces_map = {
+        w["id"]: w
+        for w in db["workspaces"].find({"id": {"$in": workspace_ids}})
+    }
+    workspace_summaries = [
         WorkspaceSummaryOut(
-            id=m.workspace.id,
-            name=m.workspace.name,
-            plan=m.workspace.plan.value,
-            role=m.role.value,
-            social_level=m.social_level.value,
+            id=m["workspace_id"],
+            name=workspaces_map.get(m["workspace_id"], {}).get("name", ""),
+            plan=workspaces_map.get(m["workspace_id"], {}).get("plan", "starter"),
+            role=m["role"],
+            social_level=m["social_level"],
         )
         for m in memberships
+        if m["workspace_id"] in workspaces_map
     ]
-    return MeResponse(user=UserOut.model_validate(current_user), workspaces=workspaces)
+    return MeResponse(user=UserOut.model_validate(public_doc(current_user)), workspaces=workspace_summaries)

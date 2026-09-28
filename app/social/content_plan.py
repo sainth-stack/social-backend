@@ -1,29 +1,19 @@
-"""Day-wise content plan: generate captions (+ images) and schedule auto-publish.
-
-Flow:
-  1. Build posting slots from workspace timezone + defaultPostingTimes / blackouts
-  2. For each day: AI caption (and image for Instagram) → create post → schedule
-  3. Celery publish_post runs at scheduled_at (existing pipeline)
-"""
+"""Day-wise content plan: generate captions (+ images) and schedule auto-publish."""
 
 from __future__ import annotations
 
 import logging
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
+from pymongo.database import Database
 
 from app.social.models import (
-    SocialAccount,
     SocialImageSource,
     SocialMediaAssetType,
     SocialPlatform,
-    SocialPost,
     SocialPostStatus,
 )
 from app.social.polish import DEFAULT_POSTING_TIMES, SocialPolishService
@@ -36,8 +26,7 @@ from app.social.schemas import (
     SchedulePostRequest,
     SocialPostPlatformIn,
 )
-from app.users.models import User
-from app.workspaces.models import Workspace, WorkspacePlan
+from app.workspaces.models import WorkspacePlan
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +55,6 @@ DAY_FOCUS_ANGLES = [
 
 
 def _resolve_plan_prompt(payload: ContentPlanGenerateRequest) -> str:
-    """User brief drives the plan; `theme` kept for backward compatibility."""
     return (payload.prompt or payload.theme or "").strip()
 
 
@@ -95,8 +83,8 @@ def build_plan_day_topic(
     return " ".join(parts)
 
 
-def _plan_cap(workspace: Workspace) -> int:
-    plan = getattr(workspace.plan, "value", None) or str(workspace.plan or "starter")
+def _plan_cap(workspace: dict) -> int:
+    plan = workspace.get("plan") or "starter"
     return PLAN_DAY_CAP.get(str(plan).lower(), 7)
 
 
@@ -116,7 +104,6 @@ def build_posting_slots(
     queue_gap_minutes: int = 30,
     start: Optional[datetime] = None,
 ) -> list[datetime]:
-    """Return `days` future UTC datetimes, one primary slot per calendar day."""
     tz = _tz(timezone_name)
     now_local = (start or datetime.now(timezone.utc)).astimezone(tz)
     times_map = posting_times or DEFAULT_POSTING_TIMES
@@ -170,9 +157,7 @@ def build_posting_slots(
                 day_cursor.year, day_cursor.month, day_cursor.day, 10, 0, tzinfo=tz
             )
             if fallback > now_local + timedelta(minutes=5):
-                if not slots or fallback >= slots[-1].astimezone(tz) + timedelta(
-                    minutes=gap
-                ):
+                if not slots or fallback >= slots[-1].astimezone(tz) + timedelta(minutes=gap):
                     chosen = fallback
 
         if chosen is not None:
@@ -190,44 +175,39 @@ def build_posting_slots(
     return slots
 
 
-def _connected_publishable(db: Session, workspace_id: uuid.UUID) -> list[SocialAccount]:
+def _connected_publishable(db: Database, workspace_id: str) -> list[dict]:
     return list(
-        db.scalars(
-            select(SocialAccount)
-            .where(
-                SocialAccount.workspace_id == workspace_id,
-                SocialAccount.is_active.is_(True),
-                SocialAccount.platform.in_(list(PUBLISHABLE)),
-            )
-            .order_by(SocialAccount.is_default.desc(), SocialAccount.created_at.asc())
-        ).all()
+        db["social_accounts"].find(
+            {
+                "workspace_id": str(workspace_id),
+                "is_active": True,
+                "platform": {"$in": [p.value for p in PUBLISHABLE]},
+            }
+        ).sort([("is_default", -1), ("created_at", 1)])
     )
 
 
-def _occupied_plan_dates(
-    db: Session,
-    workspace_id: uuid.UUID,
-    tz_name: str,
-) -> set[str]:
-    """Calendar dates (local) that already have a scheduled or published post."""
+def _occupied_plan_dates(db: Database, workspace_id: str, tz_name: str) -> set[str]:
     tz = _tz(tz_name)
-    rows = db.scalars(
-        select(SocialPost).where(
-            SocialPost.workspace_id == workspace_id,
-            SocialPost.status.in_(
-                [
-                    SocialPostStatus.DRAFT,
-                    SocialPostStatus.SCHEDULED,
-                    SocialPostStatus.PUBLISHING,
-                    SocialPostStatus.PUBLISHED,
-                    SocialPostStatus.FAILED,
-                ]
-            ),
+    posts = list(
+        db["social_posts"].find(
+            {
+                "workspace_id": str(workspace_id),
+                "status": {
+                    "$in": [
+                        SocialPostStatus.DRAFT.value,
+                        SocialPostStatus.SCHEDULED.value,
+                        SocialPostStatus.PUBLISHING.value,
+                        SocialPostStatus.PUBLISHED.value,
+                        SocialPostStatus.FAILED.value,
+                    ]
+                },
+            }
         )
-    ).all()
+    )
     occupied: set[str] = set()
-    for post in rows:
-        for dt in (post.scheduled_at, post.published_at):
+    for post in posts:
+        for dt in (post.get("scheduled_at"), post.get("published_at")):
             if dt is None:
                 continue
             if dt.tzinfo is None:
@@ -240,13 +220,13 @@ ProgressCallback = Callable[[int, int, str], None]
 
 
 class ContentPlanService:
-    def __init__(self, db: Session) -> None:
+    def __init__(self, db: Database) -> None:
         self.db = db
 
     def validate_plan_request(
         self,
-        workspace: Workspace,
-        user: User,
+        workspace: dict,
+        user: dict,
         payload: ContentPlanGenerateRequest,
     ) -> None:
         from app.social.models import SocialPermission
@@ -257,11 +237,10 @@ class ContentPlanService:
         days = min(int(payload.days), _plan_cap(workspace))
         if days < 1:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="days must be at least 1",
+                status_code=status.HTTP_400_BAD_REQUEST, detail="days must be at least 1"
             )
 
-        accounts = _connected_publishable(self.db, workspace.id)
+        accounts = _connected_publishable(self.db, workspace["id"])
         if not accounts:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -290,8 +269,8 @@ class ContentPlanService:
 
     def generate(
         self,
-        workspace: Workspace,
-        user: User,
+        workspace: dict,
+        user: dict,
         payload: ContentPlanGenerateRequest,
         progress_callback: Optional[ProgressCallback] = None,
     ) -> ContentPlanGenerateResponse:
@@ -310,11 +289,10 @@ class ContentPlanService:
         days = min(int(payload.days), cap)
         if days < 1:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="days must be at least 1",
+                status_code=status.HTTP_400_BAD_REQUEST, detail="days must be at least 1"
             )
 
-        accounts = _connected_publishable(self.db, workspace.id)
+        accounts = _connected_publishable(self.db, workspace["id"])
         if not accounts:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -335,8 +313,8 @@ class ContentPlanService:
         )
 
         social = SocialMediaService(self.db)
-        brand = social._brand_voice_dict(workspace.id)
-        brand_name = (brand.get("brand_name") or workspace.name or "our brand").strip()
+        brand = social._brand_voice_dict(workspace["id"])
+        brand_name = (brand.get("brand_name") or workspace.get("name") or "our brand").strip()
         tone = (
             payload.tone
             or settings.get("defaultTone")
@@ -351,7 +329,11 @@ class ContentPlanService:
             )
         image_style = settings.get("imageGenerationStyle")
         audience = brand.get("target_audience")
-        occupied_dates = _occupied_plan_dates(self.db, workspace.id, tz_name) if payload.skipFilledDays else set()
+        occupied_dates = (
+            _occupied_plan_dates(self.db, workspace["id"], tz_name)
+            if payload.skipFilledDays
+            else set()
+        )
 
         day_outs: list[ContentPlanDayOut] = []
         calendar_items: list[CalendarPostOut] = []
@@ -366,17 +348,16 @@ class ContentPlanService:
 
             if progress_callback:
                 progress_callback(
-                    i,
-                    len(slots),
-                    f"Day {i + 1} of {len(slots)} — {local_slot.strftime('%a %b %d')}",
+                    i, len(slots), f"Day {i + 1} of {len(slots)} — {local_slot.strftime('%a %b %d')}"
                 )
 
             if payload.skipFilledDays and slot_date in occupied_dates:
                 skipped_count += 1
                 errors.append(f"Day {i + 1} ({slot_date}): skipped — already has a post")
                 continue
+
             account = accounts[i % len(accounts)]
-            platform = account.platform
+            platform = SocialPlatform(account["platform"])
             day_focus = DAY_FOCUS_ANGLES[i % len(DAY_FOCUS_ANGLES)]
             topic = build_plan_day_topic(
                 user_prompt=user_prompt,
@@ -394,10 +375,8 @@ class ContentPlanService:
                 errors.append(f"Day {i + 1}: {exc.detail}")
                 break
 
-            # ── Caption ──────────────────────────────────────────────────────
             try:
-                record_ai_usage(self.db, workspace.id, "text", user_id=user.id)
-                self.db.commit()
+                record_ai_usage(self.db, workspace["id"], "text", user_id=user["id"])
                 result = generate_platform_content(
                     topic=topic,
                     tone=tone,
@@ -420,15 +399,13 @@ class ContentPlanService:
                 errors.append(f"Day {i + 1}: empty caption")
                 continue
 
-            # ── Image (required for Instagram; optional otherwise) ────────────
             image_url: Optional[str] = None
             image_source = SocialImageSource.NONE
             need_image = platform == SocialPlatform.INSTAGRAM or payload.generateImages
             if need_image:
                 try:
                     enforce_ai_image_limit(self.db, workspace)
-                    record_ai_usage(self.db, workspace.id, "image", user_id=user.id)
-                    self.db.commit()
+                    record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"])
                     img_data = generate_post_image(
                         topic=f"Social media image for: {caption[:180]}",
                         style=image_style,
@@ -438,8 +415,8 @@ class ContentPlanService:
                     upload: Optional[SocialBlobUpload] = None
                     if img_data.get("imageB64"):
                         upload = upload_social_image_bytes(
-                            workspace.id,
-                            img_data["imageB64"],  # type: ignore[arg-type]
+                            workspace["id"],
+                            img_data["imageB64"],
                             content_type="image/png",
                         )
                     if upload:
@@ -459,9 +436,7 @@ class ContentPlanService:
                 except Exception as exc:
                     logger.warning("Plan day %s image failed: %s", i + 1, exc)
                     if platform == SocialPlatform.INSTAGRAM:
-                        errors.append(
-                            f"Day {i + 1}: Instagram needs an image — skipped"
-                        )
+                        errors.append(f"Day {i + 1}: Instagram needs an image — skipped")
                         continue
 
             title = f"Day {i + 1}: {caption[:60]}"
@@ -479,7 +454,7 @@ class ContentPlanService:
                         platforms=[
                             SocialPostPlatformIn(
                                 platform=platform,
-                                socialAccountId=str(account.id),
+                                socialAccountId=str(account["id"]),
                                 caption=caption,
                                 hashtags=hashtags,
                             )
@@ -492,27 +467,23 @@ class ContentPlanService:
 
                 if payload.autoSchedule:
                     try:
-                        post = self._load_post(uuid.UUID(post_id))
+                        post = self._load_post(post_id)
                         scheduled = social.schedule_post(
-                            post,
-                            SchedulePostRequest(scheduledAt=slot.isoformat()),
+                            post, SchedulePostRequest(scheduledAt=slot.isoformat())
                         )
                         final_status = scheduled.status
                         scheduled_at_iso = scheduled.scheduledAt
                         scheduled_count += 1
                     except Exception as exc:
                         logger.warning("Plan day %s schedule failed: %s", i + 1, exc)
-                        # Keep intended slot visible on calendar as draft
                         try:
-                            failed_post = self._load_post(uuid.UUID(post_id))
-                            failed_post.scheduled_at = slot
-                            self.db.commit()
+                            self.db["social_posts"].update_one(
+                                {"id": post_id}, {"$set": {"scheduled_at": slot}}
+                            )
                             scheduled_at_iso = slot.isoformat()
                         except Exception:
                             scheduled_at_iso = slot.isoformat()
-                        errors.append(
-                            f"Day {i + 1}: saved as draft (schedule failed)"
-                        )
+                        errors.append(f"Day {i + 1}: saved as draft (schedule failed)")
                         draft_count += 1
                 else:
                     draft_count += 1
@@ -566,22 +537,14 @@ class ContentPlanService:
             errors=errors,
             message=(
                 f"Planned {len(day_outs)} day(s)"
-                + (
-                    f", {scheduled_count} set to auto-post"
-                    if scheduled_count
-                    else ""
-                )
+                + (f", {scheduled_count} set to auto-post" if scheduled_count else "")
                 + skip_note
                 + ("." if not errors else f" · {len(errors)} note(s).")
             ),
         )
 
-    def _load_post(self, post_id: uuid.UUID) -> SocialPost:
-        post = self.db.scalars(
-            select(SocialPost)
-            .options(selectinload(SocialPost.platforms))
-            .where(SocialPost.id == post_id)
-        ).first()
+    def _load_post(self, post_id: str) -> dict:
+        post = self.db["social_posts"].find_one({"id": str(post_id)})
         if not post:
             raise HTTPException(status_code=404, detail="Post not found")
         return post

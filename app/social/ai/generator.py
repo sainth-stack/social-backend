@@ -1,4 +1,4 @@
-"""Generate platform-native social post copy via Azure OpenAI."""
+"""Generate platform-native social post copy via OpenAI."""
 
 from __future__ import annotations
 

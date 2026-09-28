@@ -1,60 +1,73 @@
 from __future__ import annotations
 
-import uuid
-
 from fastapi import HTTPException, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
-from app.users.models import User
-from app.workspaces.models import SocialLevel, Workspace, WorkspaceMember, WorkspacePlan, WorkspaceRole
+from app.core.mongo_utils import new_id, utcnow
+from app.workspaces.models import SocialLevel, WorkspacePlan, WorkspaceRole
 
 
-def list_user_workspaces(db: Session, user: User) -> list[tuple[Workspace, WorkspaceMember]]:
-    stmt = (
-        select(WorkspaceMember)
-        .where(WorkspaceMember.user_id == user.id)
-        .join(WorkspaceMember.workspace)
+def list_user_workspaces(db: Database, user: dict) -> list[tuple[dict, dict]]:
+    memberships = list(db["workspace_members"].find({"user_id": user["id"]}))
+    result = []
+    for m in memberships:
+        workspace = db["workspaces"].find_one({"id": m["workspace_id"]})
+        if workspace:
+            result.append((workspace, m))
+    return result
+
+
+def create_workspace(db: Database, owner: dict, name: str) -> dict:
+    now = utcnow()
+    ws_id = new_id()
+    workspace = {
+        "id": ws_id,
+        "name": name,
+        "plan": WorkspacePlan.STARTER.value,
+        "owner_user_id": owner["id"],
+        "is_active": True,
+        "created_at": now,
+        "updated_at": now,
+    }
+    db["workspaces"].insert_one(workspace)
+
+    db["workspace_members"].insert_one(
+        {
+            "id": new_id(),
+            "user_id": owner["id"],
+            "workspace_id": ws_id,
+            "role": WorkspaceRole.OWNER.value,
+            "social_level": SocialLevel.ADMIN.value,
+            "created_at": now,
+        }
     )
-    memberships = db.execute(stmt).scalars().all()
-    return [(m.workspace, m) for m in memberships]
-
-
-def create_workspace(db: Session, owner: User, name: str) -> Workspace:
-    workspace = Workspace(name=name, plan=WorkspacePlan.STARTER, owner_user_id=owner.id, is_active=True)
-    db.add(workspace)
-    db.flush()
-    membership = WorkspaceMember(
-        user_id=owner.id,
-        workspace_id=workspace.id,
-        role=WorkspaceRole.OWNER,
-        social_level=SocialLevel.ADMIN,
-    )
-    db.add(membership)
-    db.commit()
     return workspace
 
 
-def list_members(db: Session, workspace_id: uuid.UUID) -> list[tuple[WorkspaceMember, User]]:
-    stmt = (
-        select(WorkspaceMember, User)
-        .join(User, User.id == WorkspaceMember.user_id)
-        .where(WorkspaceMember.workspace_id == workspace_id)
-    )
-    return [(m, u) for m, u in db.execute(stmt).all()]
+def list_members(db: Database, workspace_id: str) -> list[tuple[dict, dict]]:
+    memberships = list(db["workspace_members"].find({"workspace_id": workspace_id}))
+    result = []
+    for m in memberships:
+        user = db["users"].find_one({"id": m["user_id"]})
+        if user:
+            result.append((m, user))
+    return result
 
 
-def invite_member(db: Session, workspace_id: uuid.UUID, email: str, role: str, social_level: str) -> WorkspaceMember:
-    stmt = select(User).where(User.email == email.lower().strip())
-    user = db.execute(stmt).scalar_one_or_none()
+def invite_member(
+    db: Database,
+    workspace_id: str,
+    email: str,
+    role: str,
+    social_level: str,
+) -> dict:
+    user = db["users"].find_one({"email": email.lower().strip()})
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No user with that email")
 
-    existing = db.execute(
-        select(WorkspaceMember).where(
-            WorkspaceMember.workspace_id == workspace_id, WorkspaceMember.user_id == user.id
-        )
-    ).scalar_one_or_none()
+    existing = db["workspace_members"].find_one(
+        {"workspace_id": workspace_id, "user_id": user["id"]}
+    )
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User is already a member")
 
@@ -64,46 +77,55 @@ def invite_member(db: Session, workspace_id: uuid.UUID, email: str, role: str, s
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    member = WorkspaceMember(
-        user_id=user.id, workspace_id=workspace_id, role=role_enum, social_level=level_enum
-    )
-    db.add(member)
-    db.commit()
+    member = {
+        "id": new_id(),
+        "user_id": user["id"],
+        "workspace_id": workspace_id,
+        "role": role_enum.value,
+        "social_level": level_enum.value,
+        "created_at": utcnow(),
+    }
+    db["workspace_members"].insert_one(member)
     return member
 
 
 def update_member(
-    db: Session,
-    workspace_id: uuid.UUID,
-    member_id: uuid.UUID,
+    db: Database,
+    workspace_id: str,
+    member_id: str,
     role: str | None,
     social_level: str | None,
-) -> WorkspaceMember:
-    member = db.get(WorkspaceMember, member_id)
-    if not member or member.workspace_id != workspace_id:
+) -> dict:
+    member = db["workspace_members"].find_one({"id": member_id})
+    if not member or member["workspace_id"] != workspace_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
 
+    updates: dict = {}
     if role is not None:
         try:
-            member.role = WorkspaceRole(role)
+            updates["role"] = WorkspaceRole(role).value
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     if social_level is not None:
         try:
-            member.social_level = SocialLevel(social_level)
+            updates["social_level"] = SocialLevel(social_level).value
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    db.commit()
+    if updates:
+        db["workspace_members"].update_one({"id": member_id}, {"$set": updates})
+        member = db["workspace_members"].find_one({"id": member_id})
     return member
 
 
-def remove_member(db: Session, workspace_id: uuid.UUID, member_id: uuid.UUID) -> None:
-    member = db.get(WorkspaceMember, member_id)
-    if not member or member.workspace_id != workspace_id:
+def remove_member(db: Database, workspace_id: str, member_id: str) -> None:
+    member = db["workspace_members"].find_one({"id": member_id})
+    if not member or member["workspace_id"] != workspace_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
-    workspace = db.get(Workspace, workspace_id)
-    if workspace and workspace.owner_user_id == member.user_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot remove the workspace owner")
-    db.delete(member)
-    db.commit()
+    workspace = db["workspaces"].find_one({"id": workspace_id})
+    if workspace and workspace.get("owner_user_id") == member["user_id"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot remove the workspace owner",
+        )
+    db["workspace_members"].delete_one({"id": member_id})

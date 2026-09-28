@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
-
 from app.core.config import settings
-from app.core.database import SessionLocal
+from app.core.database import get_database
 from app.core.security import hash_password
+from app.core.mongo_utils import new_id, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -24,56 +22,57 @@ def seed_platform_admin() -> None:
     if not settings.admin_email or not settings.admin_password:
         return
 
-    from app.users.models import User
-    from app.workspaces.models import SocialLevel, Workspace, WorkspaceMember, WorkspacePlan, WorkspaceRole
-
+    db = get_database()
     email = settings.admin_email.lower().strip()
-    db = SessionLocal()
-    try:
-        user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
-        if user:
-            if not user.is_platform_admin or not user.is_active:
-                user.is_platform_admin = True
-                user.is_active = True
-                db.commit()
-                logger.info("Promoted existing user %s to platform admin", email)
-            return
 
-        user = User(
-            email=email,
-            password_hash=hash_password(settings.admin_password),
-            full_name="Platform Admin",
-            is_active=True,
-            is_platform_admin=True,
-        )
-        db.add(user)
-        db.flush()
-
-        workspace = Workspace(
-            name="OpsBrain Admin",
-            plan=WorkspacePlan.ENTERPRISE,
-            owner_user_id=user.id,
-            is_active=True,
-        )
-        db.add(workspace)
-        db.flush()
-
-        db.add(
-            WorkspaceMember(
-                user_id=user.id,
-                workspace_id=workspace.id,
-                role=WorkspaceRole.OWNER,
-                social_level=SocialLevel.ADMIN,
+    user = db["users"].find_one({"email": email})
+    if user:
+        if not user.get("is_platform_admin") or not user.get("is_active"):
+            db["users"].update_one(
+                {"email": email},
+                {"$set": {"is_platform_admin": True, "is_active": True}},
             )
-        )
-        db.commit()
-        logger.info("Seeded platform admin user %s", email)
-    except IntegrityError:
-        db.rollback()
-        # Another uvicorn worker seeded the same admin concurrently.
-        logger.info("Platform admin %s already exists", email)
-    except Exception:
-        db.rollback()
-        logger.exception("Failed to seed platform admin (non-fatal)")
-    finally:
-        db.close()
+            logger.info("Promoted existing user %s to platform admin", email)
+        return
+
+    user_id = new_id()
+    now = utcnow()
+    db["users"].insert_one(
+        {
+            "id": user_id,
+            "email": email,
+            "password_hash": hash_password(settings.admin_password),
+            "full_name": "Platform Admin",
+            "is_active": True,
+            "is_platform_admin": True,
+            "google_id": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+
+    ws_id = new_id()
+    db["workspaces"].insert_one(
+        {
+            "id": ws_id,
+            "name": "OpsBrain Admin",
+            "plan": "enterprise",
+            "owner_user_id": user_id,
+            "is_active": True,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+
+    mem_id = new_id()
+    db["workspace_members"].insert_one(
+        {
+            "id": mem_id,
+            "user_id": user_id,
+            "workspace_id": ws_id,
+            "role": "owner",
+            "social_level": "admin",
+            "created_at": now,
+        }
+    )
+    logger.info("Seeded platform admin user %s", email)

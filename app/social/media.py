@@ -1,8 +1,8 @@
-"""Upload social post images and videos to object storage and return HTTPS URLs.
+"""Upload social post images and videos to Amazon S3 and return HTTPS URLs.
 
 Instagram (and other platforms) require a publicly reachable media URL — not
-data: URIs or private localhost paths. We store bytes in S3 or Azure Blob and
-return a long-lived read URL Meta can fetch.
+data: URIs or private localhost paths. We store bytes in S3 and return a
+long-lived read URL Meta can fetch.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from app.providers.storage.factory import get_storage_provider
 
 logger = logging.getLogger(__name__)
 
-# Instagram needs to fetch the media; keep SAS valid for scheduled posts.
+# Instagram needs to fetch the media; keep presigned URLs valid for scheduled posts.
 _SAS_EXPIRES_SECONDS = 60 * 60 * 24 * 30  # 30 days
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024    # 8 MB
 _MAX_LOGO_BYTES = 5 * 1024 * 1024     # 5 MB
@@ -55,32 +55,25 @@ class SocialBlobUpload:
 
 
 def refresh_blob_url(blob_key: str) -> str:
-    """Return a fresh read SAS URL for an existing blob key."""
+    """Return a fresh presigned GET URL for an existing S3 key."""
     return _public_url_for_key(blob_key)
 
 
 def blob_key_from_url(url: str) -> Optional[str]:
-    """Extract storage key from an S3 or Azure Blob URL if possible."""
+    """Extract storage key from an S3 URL if possible."""
     try:
         parsed = urlparse(url)
         host = parsed.netloc.lower()
         path = parsed.path.lstrip("/")
-        if not path:
+        if not path or ".amazonaws.com" not in host:
             return None
-        if "blob.core.windows.net" in host:
+        if host.startswith("s3.") or host.startswith("s3-"):
             if "/" not in path:
                 return None
             return path.split("/", 1)[1]
-        if ".amazonaws.com" in host:
-            # peers/bucket.s3.region.amazonaws.com/key or s3.region.amazonaws.com/bucket/key
-            if host.startswith("s3.") or host.startswith("s3-"):
-                if "/" not in path:
-                    return None
-                return path.split("/", 1)[1]
-            return path
+        return path
     except Exception:
         return None
-    return None
 
 
 def _is_our_storage_url(url: str) -> bool:
@@ -88,7 +81,7 @@ def _is_our_storage_url(url: str) -> bool:
         host = urlparse(url).netloc.lower()
     except Exception:
         return False
-    return "blob.core.windows.net" in host or ".amazonaws.com" in host
+    return ".amazonaws.com" in host
 
 
 def _public_url_for_key(key: str) -> str:
@@ -103,7 +96,7 @@ def upload_social_image_bytes(
     content_type: str = "image/jpeg",
     filename_hint: Optional[str] = None,
 ) -> SocialBlobUpload:
-    """Upload image bytes to Azure Blob and return a public HTTPS (SAS) URL."""
+    """Upload image bytes to S3 and return a public HTTPS URL."""
     if not data:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -183,7 +176,7 @@ def upload_social_video_bytes(
     content_type: str = "video/mp4",
     filename_hint: Optional[str] = None,
 ) -> SocialBlobUpload:
-    """Upload video bytes to Azure Blob and return a public HTTPS (SAS) URL."""
+    """Upload video bytes to S3 and return a public HTTPS URL."""
     if not data:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -262,10 +255,10 @@ def ensure_public_image_url(
 ) -> Optional[str]:
     """Return an HTTPS URL Instagram/Meta can fetch.
 
-    - data: URIs → upload to Azure Blob
-    - ephemeral remote URLs (e.g. OpenAI) → download + upload to Blob
-    - existing Azure Blob URLs → keep (unless force_reupload)
-    - other http(s) URLs → re-host on Blob so they stay available for schedules
+    - data: URIs → upload to S3
+    - ephemeral remote URLs (e.g. OpenAI) → download + upload to S3
+    - existing S3 URLs → keep (unless force_reupload)
+    - other http(s) URLs → re-host on S3 so they stay available for schedules
     """
     if not image_url or not str(image_url).strip():
         return None

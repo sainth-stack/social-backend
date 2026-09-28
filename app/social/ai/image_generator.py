@@ -1,14 +1,4 @@
-"""AI image generation via Azure AI Foundry / OpenAI gpt-image-2.
-
-Uses the same client shape as Foundry samples::
-
-    client = OpenAI(base_url=\"...services.ai.azure.com/openai/v1\", api_key=...)
-    img = client.images.generate(model=\"gpt-image-2\", prompt=..., n=1, size=\"1024x1024\")
-    image_bytes = base64.b64decode(img.data[0].b64_json)
-
-``get_image_client()`` already selects the Foundry OpenAI client when
-``AZURE_OPENAI_ENDPOINT`` is a ``services.ai.azure.com`` URL.
-"""
+"""AI image generation via OpenAI (dall-e-3 / gpt-image-2)."""
 
 from __future__ import annotations
 
@@ -86,8 +76,7 @@ def _download_source_image(url: str) -> bytes:
 
 
 def _generate_create(client, *, model: str, prompt: str, size: str):
-    """Foundry-compatible create call (matches Azure sample)."""
-    # Primary: Foundry / OpenAI v1 style (returns b64_json by default).
+    """OpenAI Images API create call."""
     try:
         return client.images.generate(
             model=model,
@@ -96,7 +85,6 @@ def _generate_create(client, *, model: str, prompt: str, size: str):
             size=size,
         )
     except Exception as first_exc:
-        # Fallback for classic Azure OpenAI that still wants response_format.
         try:
             return client.images.generate(
                 model=model,
@@ -117,13 +105,12 @@ def generate_post_image(
     mode: ImageGenerationMode = "create",
     source_image_bytes: Optional[bytes] = None,
 ) -> dict[str, str | bytes]:
-    """Generate or edit an image for a social post via gpt-image-2."""
-    if not settings.azure_openai_api_key or not settings.azure_openai_endpoint:
+    """Generate or edit an image for a social post via OpenAI image API."""
+    if not settings.openai_api_key:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "Image generation is not configured. Set AZURE_OPENAI_API_KEY and "
-                "AZURE_OPENAI_ENDPOINT, or upload an image instead."
+                "Image generation is not configured. Set OPENAI_API_KEY, or upload an image instead."
             ),
         )
 
@@ -141,7 +128,8 @@ def generate_post_image(
             detail="Image generation is not available",
         ) from exc
 
-    model = settings.azure_openai_image_deployment  # gpt-image-2
+    from app.core.config import settings as _s
+    model = _s.openai_image_deployment  # dall-e-3 or gpt-image-2
 
     try:
         client = get_image_client()
@@ -183,9 +171,8 @@ def generate_post_image(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                f"Image {action} failed. Ensure AZURE_OPENAI_ENDPOINT points to "
-                "your Foundry resource (...services.ai.azure.com/openai/v1) and "
-                f"AZURE_OPENAI_IMAGE_DEPLOYMENT={model} exists. "
+                f"Image {action} failed (model={model}). "
+                "Check OPENAI_API_KEY and OPENAI_IMAGE_DEPLOYMENT. "
                 "You can also upload an image instead."
             ),
         ) from exc

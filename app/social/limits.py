@@ -1,27 +1,18 @@
-"""Plan-limit enforcement for the Social Media module.
-
-All limits are sourced from ``app.plans.service.get_effective_plan()`` — the
-hardcoded catalog in ``app.plans.catalog`` merged with any admin-configured
-``PlanOverride`` row. This is the ONLY place that should read plan limits;
-never hardcode a number here.
-"""
+"""Plan-limit enforcement for the Social Media module."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from app.plans.catalog import PlanDefinition, is_unlimited
 from app.plans.service import count_ai_usage_this_month, get_effective_plan
-from app.social.models import SocialAccount, SocialPost, SocialTemplate
-from app.workspaces.models import Workspace
 
 
-def get_limits(db: Session, workspace: Workspace) -> PlanDefinition:
-    return get_effective_plan(db, workspace.plan.value)
+def get_limits(db: Database, workspace: dict) -> PlanDefinition:
+    return get_effective_plan(db, workspace.get("plan", "starter"))
 
 
 def _month_start() -> datetime:
@@ -36,17 +27,14 @@ def _payment_required(code: str, message: str, limit: int, used: int) -> HTTPExc
     )
 
 
-def enforce_account_limit(db: Session, workspace: Workspace) -> None:
+def enforce_account_limit(db: Database, workspace: dict) -> None:
     plan = get_limits(db, workspace)
     limit = plan.limits.connected_accounts
     if is_unlimited(limit):
         return
-    count = db.scalar(
-        select(func.count()).select_from(SocialAccount).where(
-            SocialAccount.workspace_id == workspace.id,
-            SocialAccount.is_active.is_(True),
-        )
-    ) or 0
+    count = db["social_accounts"].count_documents(
+        {"workspace_id": workspace["id"], "is_active": True}
+    )
     if count >= limit:
         raise _payment_required(
             "PLAN_LIMIT_ACCOUNTS",
@@ -56,17 +44,14 @@ def enforce_account_limit(db: Session, workspace: Workspace) -> None:
         )
 
 
-def enforce_posts_limit(db: Session, workspace: Workspace) -> None:
+def enforce_posts_limit(db: Database, workspace: dict) -> None:
     plan = get_limits(db, workspace)
     limit = plan.limits.posts_per_month
     if is_unlimited(limit):
         return
-    count = db.scalar(
-        select(func.count()).select_from(SocialPost).where(
-            SocialPost.workspace_id == workspace.id,
-            SocialPost.created_at >= _month_start(),
-        )
-    ) or 0
+    count = db["social_posts"].count_documents(
+        {"workspace_id": workspace["id"], "created_at": {"$gte": _month_start()}}
+    )
     if count >= limit:
         raise _payment_required(
             "PLAN_LIMIT_POSTS",
@@ -76,17 +61,14 @@ def enforce_posts_limit(db: Session, workspace: Workspace) -> None:
         )
 
 
-def enforce_templates_limit(db: Session, workspace: Workspace) -> None:
+def enforce_templates_limit(db: Database, workspace: dict) -> None:
     plan = get_limits(db, workspace)
     limit = plan.limits.templates
     if is_unlimited(limit):
         return
-    count = db.scalar(
-        select(func.count()).select_from(SocialTemplate).where(
-            SocialTemplate.workspace_id == workspace.id,
-            SocialTemplate.is_system.is_(False),
-        )
-    ) or 0
+    count = db["social_templates"].count_documents(
+        {"workspace_id": workspace["id"], "is_system": False}
+    )
     if count >= limit:
         raise _payment_required(
             "PLAN_LIMIT_TEMPLATES",
@@ -96,7 +78,7 @@ def enforce_templates_limit(db: Session, workspace: Workspace) -> None:
         )
 
 
-def enforce_approval_available(db: Session, workspace: Workspace) -> None:
+def enforce_approval_available(db: Database, workspace: dict) -> None:
     plan = get_limits(db, workspace)
     if not plan.limits.approval_workflow:
         raise HTTPException(
@@ -110,10 +92,10 @@ def enforce_approval_available(db: Session, workspace: Workspace) -> None:
 
 # ── AI generation quotas (text / image / video) — enforced separately ──────
 
-def _enforce_ai_limit(db: Session, workspace: Workspace, kind: str, limit: int, plan_name: str) -> None:
+def _enforce_ai_limit(db: Database, workspace: dict, kind: str, limit: int, plan_name: str) -> None:
     if is_unlimited(limit):
         return
-    used = count_ai_usage_this_month(db, workspace.id, kind)
+    used = count_ai_usage_this_month(db, workspace["id"], kind)
     if used >= limit:
         label = {"text": "AI text generations", "image": "AI images", "video": "AI videos"}[kind]
         raise _payment_required(
@@ -124,17 +106,17 @@ def _enforce_ai_limit(db: Session, workspace: Workspace, kind: str, limit: int, 
         )
 
 
-def enforce_ai_text_limit(db: Session, workspace: Workspace) -> None:
+def enforce_ai_text_limit(db: Database, workspace: dict) -> None:
     plan = get_limits(db, workspace)
     _enforce_ai_limit(db, workspace, "text", plan.limits.ai_text_per_month, plan.name)
 
 
-def enforce_ai_image_limit(db: Session, workspace: Workspace) -> None:
+def enforce_ai_image_limit(db: Database, workspace: dict) -> None:
     plan = get_limits(db, workspace)
     _enforce_ai_limit(db, workspace, "image", plan.limits.ai_images_per_month, plan.name)
 
 
-def enforce_ai_video_limit(db: Session, workspace: Workspace) -> None:
+def enforce_ai_video_limit(db: Database, workspace: dict) -> None:
     plan = get_limits(db, workspace)
     if plan.limits.ai_videos_per_month == 0:
         raise HTTPException(
@@ -147,31 +129,22 @@ def enforce_ai_video_limit(db: Session, workspace: Workspace) -> None:
     _enforce_ai_limit(db, workspace, "video", plan.limits.ai_videos_per_month, plan.name)
 
 
-def usage_snapshot(db: Session, workspace: Workspace) -> dict:
+def usage_snapshot(db: Database, workspace: dict) -> dict:
     plan = get_limits(db, workspace)
-    accounts = db.scalar(
-        select(func.count()).select_from(SocialAccount).where(
-            SocialAccount.workspace_id == workspace.id,
-            SocialAccount.is_active.is_(True),
-        )
-    ) or 0
-    posts = db.scalar(
-        select(func.count()).select_from(SocialPost).where(
-            SocialPost.workspace_id == workspace.id,
-            SocialPost.created_at >= _month_start(),
-        )
-    ) or 0
-    templates = db.scalar(
-        select(func.count()).select_from(SocialTemplate).where(
-            SocialTemplate.workspace_id == workspace.id,
-            SocialTemplate.is_system.is_(False),
-        )
-    ) or 0
-    ai_text = count_ai_usage_this_month(db, workspace.id, "text")
-    ai_images = count_ai_usage_this_month(db, workspace.id, "image")
-    ai_videos = count_ai_usage_this_month(db, workspace.id, "video")
+    accounts = db["social_accounts"].count_documents(
+        {"workspace_id": workspace["id"], "is_active": True}
+    )
+    posts = db["social_posts"].count_documents(
+        {"workspace_id": workspace["id"], "created_at": {"$gte": _month_start()}}
+    )
+    templates = db["social_templates"].count_documents(
+        {"workspace_id": workspace["id"], "is_system": False}
+    )
+    ai_text = count_ai_usage_this_month(db, workspace["id"], "text")
+    ai_images = count_ai_usage_this_month(db, workspace["id"], "image")
+    ai_videos = count_ai_usage_this_month(db, workspace["id"], "video")
     return {
-        "plan": workspace.plan.value,
+        "plan": workspace.get("plan", "starter"),
         "accounts": {"used": accounts, "limit": plan.limits.connected_accounts},
         "postsThisMonth": {"used": posts, "limit": plan.limits.posts_per_month},
         "templates": {"used": templates, "limit": plan.limits.templates},

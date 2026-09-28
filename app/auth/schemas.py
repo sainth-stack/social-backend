@@ -34,6 +34,7 @@ class UserOut(BaseModel):
 
     class Config:
         from_attributes = True
+        extra = "ignore"
 
 
 class WorkspaceSummaryOut(BaseModel):
@@ -45,6 +46,7 @@ class WorkspaceSummaryOut(BaseModel):
 
     class Config:
         from_attributes = True
+        extra = "ignore"
 
 
 class MeResponse(BaseModel):

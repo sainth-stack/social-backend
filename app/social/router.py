@@ -19,15 +19,13 @@ from fastapi import (
     status,
 )
 from fastapi.responses import HTMLResponse
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from app.auth.deps import get_current_user
 from app.core.database import get_db
-from app.workspaces.models import Workspace
-from app.users.models import User
 from app.workspaces.deps import require_workspace_access
 from app.social.dependencies import get_social_account_or_404, get_social_post_or_404
-from app.social.models import SocialAccount, SocialPlatform, SocialPost
+from app.social.models import SocialPlatform
 from app.social.schemas import (
     AnalyticsOverviewOut,
     ApplyTemplateRequest,
@@ -101,9 +99,9 @@ def _parse_platform(platform: str) -> SocialPlatform:
 @router.get("/accounts", response_model=SocialAccountListResponse)
 def list_accounts(
     platform: Optional[str] = Query(default=None),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialAccountListResponse:
     platform_enum = _parse_platform(platform) if platform else None
     items = SocialMediaService(db).list_accounts(workspace, platform_enum)
@@ -113,9 +111,9 @@ def list_accounts(
 @router.post("/accounts", response_model=SocialAccountOut, status_code=status.HTTP_201_CREATED)
 def create_account(
     payload: CreateSocialAccountRequest,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialAccountOut:
     return SocialMediaService(db).create_account(workspace, payload)
 
@@ -123,18 +121,18 @@ def create_account(
 @router.patch("/accounts/{account_id}", response_model=SocialAccountOut)
 def update_account(
     payload: UpdateSocialAccountRequest,
-    account: SocialAccount = Depends(get_social_account_or_404),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    account: dict = Depends(get_social_account_or_404),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialAccountOut:
     return SocialMediaService(db).update_account(account, payload)
 
 
 @router.delete("/accounts/{account_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_account(
-    account: SocialAccount = Depends(get_social_account_or_404),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    account: dict = Depends(get_social_account_or_404),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> Response:
     SocialMediaService(db).delete_account(account)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -142,24 +140,24 @@ def delete_account(
 
 @router.post("/accounts/{account_id}/sync", response_model=SocialAccountOut)
 def sync_account(
-    account: SocialAccount = Depends(get_social_account_or_404),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    account: dict = Depends(get_social_account_or_404),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialAccountOut:
     return SocialMediaService(db).sync_account(account)
 
 
 @router.post("/accounts/{account_id}/reconnect", response_model=OAuthUrlResponse)
 def reconnect_account(
-    account: SocialAccount = Depends(get_social_account_or_404),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    account: dict = Depends(get_social_account_or_404),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> OAuthUrlResponse:
     url = SocialMediaService(db).get_oauth_url(
         workspace,
-        account.platform,
-        reconnect_account_id=account.id,
+        SocialPlatform(account["platform"]),
+        reconnect_account_id=account["id"],
     )
     return OAuthUrlResponse(url=url)
 
@@ -170,9 +168,9 @@ def reconnect_account(
 @router.get("/oauth/{platform}/url", response_model=OAuthUrlResponse)
 def get_oauth_url(
     platform: str,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> OAuthUrlResponse:
     platform_enum = _parse_platform(platform)
     url = SocialMediaService(db).get_oauth_url(workspace, platform_enum)
@@ -183,9 +181,9 @@ def get_oauth_url(
 def oauth_callback_api(
     platform: str,
     payload: OAuthCallbackRequest,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialAccountListResponse:
     """Exchange code when the frontend receives it (non-popup fallback)."""
     platform_enum = _parse_platform(platform)
@@ -194,7 +192,7 @@ def oauth_callback_api(
     )
     # Ensure accounts belong to the requesting org (state already binds org).
     for item in items:
-        if item.workspaceId != str(workspace.id):
+        if item.workspaceId != str(workspace["id"]):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
     return SocialAccountListResponse(items=items)
 
@@ -228,7 +226,7 @@ def oauth_callback_browser(
     state: Optional[str] = Query(default=None),
     error: Optional[str] = Query(default=None),
     error_description: Optional[str] = Query(default=None),
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ) -> HTMLResponse:
     """Meta redirects here after user consent; closes popup via postMessage."""
     if error:
@@ -263,18 +261,18 @@ def oauth_callback_browser(
 @router.get("/posts", response_model=SocialPostListResponse)
 def list_posts(
     params: SocialPostListParams = Depends(),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialPostListResponse:
     return SocialMediaService(db).list_posts(workspace, params)
 
 
 @router.get("/posts/{post_id}", response_model=SocialPostOut)
 def get_post(
-    post: SocialPost = Depends(get_social_post_or_404),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     return SocialMediaService(db).get_post(post)
 
@@ -282,9 +280,9 @@ def get_post(
 @router.post("/posts", response_model=SocialPostOut, status_code=status.HTTP_201_CREATED)
 def create_post(
     payload: CreateSocialPostRequest,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     return SocialMediaService(db).create_post(workspace, current_user, payload)
 
@@ -292,10 +290,10 @@ def create_post(
 @router.patch("/posts/{post_id}", response_model=SocialPostOut)
 def update_post(
     payload: UpdateSocialPostRequest,
-    post: SocialPost = Depends(get_social_post_or_404),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     return SocialMediaService(db).update_post(post, workspace, payload)
 
@@ -303,10 +301,10 @@ def update_post(
 @router.post("/posts/{post_id}/regenerate-content", response_model=SocialPostOut)
 def regenerate_post_content(
     payload: RegeneratePostContentRequest,
-    post: SocialPost = Depends(get_social_post_or_404),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     return SocialMediaService(db).regenerate_post_content(
         post,
@@ -319,9 +317,9 @@ def regenerate_post_content(
 
 @router.delete("/posts/{post_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_post(
-    post: SocialPost = Depends(get_social_post_or_404),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> Response:
     SocialMediaService(db).delete_post(post)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -329,10 +327,10 @@ def delete_post(
 
 @router.post("/posts/{post_id}/duplicate", response_model=SocialPostOut, status_code=status.HTTP_201_CREATED)
 def duplicate_post(
-    post: SocialPost = Depends(get_social_post_or_404),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     return SocialMediaService(db).duplicate_post(post, current_user, workspace)
 
@@ -340,45 +338,45 @@ def duplicate_post(
 @router.post("/posts/{post_id}/schedule", response_model=SocialPostOut)
 def schedule_post(
     payload: SchedulePostRequest,
-    post: SocialPost = Depends(get_social_post_or_404),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     return SocialMediaService(db).schedule_post(post, payload)
 
 
 @router.post("/posts/{post_id}/publish-now", response_model=SocialPostOut)
 def publish_now(
-    post: SocialPost = Depends(get_social_post_or_404),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     return SocialMediaService(db).publish_now(post)
 
 
 @router.post("/posts/{post_id}/cancel-schedule", response_model=SocialPostOut)
 def cancel_schedule(
-    post: SocialPost = Depends(get_social_post_or_404),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     return SocialMediaService(db).cancel_schedule(post)
 
 
 @router.post("/posts/{post_id}/archive", response_model=SocialPostOut)
 def archive_post(
-    post: SocialPost = Depends(get_social_post_or_404),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     return SocialMediaService(db).archive_post(post)
 
 
 @router.post("/posts/{post_id}/retry", response_model=RetryResponse)
 def retry_post(
-    post: SocialPost = Depends(get_social_post_or_404),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> RetryResponse:
     return SocialMediaService(db).retry_post(post)
 
@@ -386,9 +384,9 @@ def retry_post(
 @router.post("/posts/bulk-retry", response_model=BulkRetryResponse)
 def bulk_retry(
     payload: BulkRetryRequest,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> BulkRetryResponse:
     return SocialMediaService(db).bulk_retry(workspace, payload.postIds)
 
@@ -396,9 +394,9 @@ def bulk_retry(
 @router.get("/calendar", response_model=CalendarResponse)
 def calendar(
     month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> CalendarResponse:
     return SocialMediaService(db).calendar(workspace, month)
 
@@ -410,9 +408,9 @@ def calendar(
 )
 def generate_content_plan(
     payload: ContentPlanGenerateRequest,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> ContentPlanJobStartResponse:
     """Enqueue async day-wise content plan generation."""
     from app.social.content_plan import ContentPlanService
@@ -423,7 +421,7 @@ def generate_content_plan(
 
     try:
         task = generate_content_plan_task.apply_async(
-            args=[str(workspace.id), str(current_user.id), payload.model_dump(mode="json")],
+            args=[str(workspace["id"]), str(current_user["id"]), payload.model_dump(mode="json")],
             queue="social_maintenance",
         )
         return ContentPlanJobStartResponse(jobId=task.id)
@@ -445,8 +443,8 @@ def generate_content_plan(
 @router.get("/content-plan/jobs/{job_id}", response_model=ContentPlanJobStatusResponse)
 def get_content_plan_job(
     job_id: str,
-    workspace: Workspace = Depends(require_workspace_access),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    _: dict = Depends(get_current_user),
 ) -> ContentPlanJobStatusResponse:
     """Poll async content plan job status and result."""
     from celery.result import AsyncResult
@@ -499,9 +497,9 @@ def get_content_plan_job(
 def analytics_overview(
     from_date: Optional[str] = Query(default=None, alias="from"),
     to_date: Optional[str] = Query(default=None, alias="to"),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> AnalyticsOverviewOut:
     return SocialMediaService(db).analytics_overview(workspace, from_date, to_date)
 
@@ -511,9 +509,9 @@ def analytics_platform(
     platform: str,
     from_date: Optional[str] = Query(default=None, alias="from"),
     to_date: Optional[str] = Query(default=None, alias="to"),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> PlatformAnalyticsOut:
     return SocialMediaService(db).analytics_platform(
         workspace, _parse_platform(platform), from_date, to_date
@@ -526,9 +524,9 @@ def analytics_posts(
     to_date: Optional[str] = Query(default=None, alias="to"),
     sort: str = Query(default="engagementRate"),
     order: str = Query(default="desc"),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> PostPerformanceOut:
     return SocialMediaService(db).analytics_posts(
         workspace, from_date, to_date, sort=sort, order=order
@@ -539,9 +537,9 @@ def analytics_posts(
 def analytics_audience(
     from_date: Optional[str] = Query(default=None, alias="from"),
     to_date: Optional[str] = Query(default=None, alias="to"),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> AudienceGrowthOut:
     return SocialMediaService(db).analytics_audience(workspace, from_date, to_date)
 
@@ -551,9 +549,9 @@ def analytics_audience(
 
 @router.get("/brand-voice", response_model=BrandVoiceOut)
 def get_brand_voice(
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> BrandVoiceOut:
     return SocialMediaService(db).get_brand_voice(workspace)
 
@@ -561,9 +559,9 @@ def get_brand_voice(
 @router.put("/brand-voice", response_model=BrandVoiceOut)
 def put_brand_voice(
     payload: BrandVoiceUpdateRequest,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> BrandVoiceOut:
     return SocialMediaService(db).upsert_brand_voice(workspace, payload)
 
@@ -571,9 +569,9 @@ def put_brand_voice(
 @router.post("/brand-voice/test", response_model=BrandVoiceTestResponse)
 def test_brand_voice(
     payload: Optional[BrandVoiceUpdateRequest] = Body(default=None),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> BrandVoiceTestResponse:
     return SocialMediaService(db).test_brand_voice(workspace, payload)
 
@@ -581,9 +579,9 @@ def test_brand_voice(
 @router.post("/generate", response_model=GeneratePostResponse)
 def generate_post(
     payload: GeneratePostRequest,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    user: dict = Depends(get_current_user),
 ) -> GeneratePostResponse:
     return SocialMediaService(db).generate_post(workspace, payload, user)
 
@@ -591,9 +589,9 @@ def generate_post(
 @router.post("/generate-image", response_model=GenerateImageResponse)
 def generate_image(
     payload: GenerateImageRequest,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    user: dict = Depends(get_current_user),
 ) -> GenerateImageResponse:
     return SocialMediaService(db).generate_image(
         workspace,
@@ -608,12 +606,12 @@ def generate_image(
 
 @router.post("/upload-logo", response_model=UploadLogoResponse)
 async def upload_logo(
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
     file: UploadFile = File(...),
 ) -> UploadLogoResponse:
-    """Upload workspace logo to S3/Azure; persists on brand voice profile."""
+    """Upload workspace logo to S3; persists on brand voice profile."""
     data = await file.read()
     logo_url = SocialMediaService(db).upload_logo(
         workspace,
@@ -626,9 +624,9 @@ async def upload_logo(
 
 @router.post("/upload-image", response_model=GenerateImageResponse)
 async def upload_image(
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    user: dict = Depends(get_current_user),
     file: UploadFile = File(...),
 ) -> GenerateImageResponse:
     """Upload a social post image to object storage; returns a public HTTPS URL."""
@@ -644,9 +642,9 @@ async def upload_image(
 
 @router.post("/generate-video", response_model=GenerateVideoResponse)
 async def generate_video(
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    user: dict = Depends(get_current_user),
     prompt: str = Form(...),
     size: str = Form("1280x720"),
     seconds: str = Form("4"),
@@ -655,18 +653,18 @@ async def generate_video(
     mode: str = Form("create"),
     remix_video_id: Optional[str] = Form(None),
 ) -> GenerateVideoResponse:
-    """Generate a social post video using Azure OpenAI Sora 2 (gated preview).
+    """Generate a social post video when a video provider is configured.
 
     Optional ``reference_image`` file or ``reference_image_url`` guides generation
     (logo, brand asset, or first frame). Image is resized to match ``size``.
 
-    Returns HTTP 503 with ``{"error": "sora_unavailable", ...}`` when Sora 2
-    access is not provisioned on the Azure subscription/region.
+    Returns HTTP 503 with ``{"error": "video_unavailable", ...}`` when video
+    generation is disabled or no provider is configured.
     """
     if seconds not in ("4", "8", "12"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Video duration must be 4, 8, or 12 seconds on Azure Sora 2.",
+            detail="Video duration must be 4, 8, or 12 seconds.",
         )
     if len(prompt) > 1000:
         raise HTTPException(
@@ -712,18 +710,18 @@ async def generate_video(
     except VideoGenerationUnavailableError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"error": "sora_unavailable", "message": exc.detail},
+            detail={"error": "video_unavailable", "message": exc.detail},
         ) from exc
 
 
 @router.post("/upload-video", response_model=UploadVideoResponse)
 async def upload_video(
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    user: dict = Depends(get_current_user),
     file: UploadFile = File(...),
 ) -> UploadVideoResponse:
-    """Upload a social post video to Azure Blob; returns a public HTTPS URL."""
+    """Upload a social post video to S3; returns a public HTTPS URL."""
     content_type = file.content_type or "video/mp4"
     if not content_type.startswith("video/"):
         raise HTTPException(
@@ -742,9 +740,9 @@ async def upload_video(
 
 @router.get("/media-assets", response_model=MediaAssetListResponse)
 def list_media_assets(
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
     params: MediaAssetListParams = Depends(),
 ) -> MediaAssetListResponse:
     return SocialMediaService(db).list_media_assets(workspace, params)
@@ -753,9 +751,9 @@ def list_media_assets(
 @router.get("/media-assets/{asset_id}", response_model=MediaAssetOut)
 def get_media_asset(
     asset_id: uuid.UUID,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> MediaAssetOut:
     return SocialMediaService(db).get_media_asset(workspace, asset_id)
 
@@ -763,9 +761,9 @@ def get_media_asset(
 @router.delete("/media-assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_media_asset(
     asset_id: uuid.UUID,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> Response:
     SocialMediaService(db).delete_media_asset(workspace, asset_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -776,9 +774,9 @@ def delete_media_asset(
 
 @router.get("/settings")
 def get_settings(
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> dict:
     from app.social.polish import SocialPolishService
 
@@ -788,9 +786,9 @@ def get_settings(
 @router.put("/settings")
 def put_settings(
     payload: dict,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> dict:
     from app.social.polish import SocialPolishService
 
@@ -799,9 +797,9 @@ def put_settings(
 
 @router.get("/team-permissions")
 def list_team_permissions(
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> list[dict]:
     from app.social.polish import SocialPolishService
 
@@ -812,9 +810,9 @@ def list_team_permissions(
 def update_team_permission(
     user_id: uuid.UUID,
     payload: dict,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> dict:
     from app.social.models import SocialPermission
     from app.social.polish import SocialPolishService
@@ -827,9 +825,9 @@ def update_team_permission(
 
 @router.get("/templates")
 def list_templates(
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> list[dict]:
     from app.social.polish import SocialPolishService
 
@@ -840,9 +838,9 @@ def list_templates(
 def apply_template(
     template_id: uuid.UUID,
     payload: ApplyTemplateRequest,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> ApplyTemplateResponse:
     from app.social.polish import SocialPolishService
 
@@ -858,9 +856,9 @@ def apply_template(
 @router.post("/templates", status_code=status.HTTP_201_CREATED)
 def create_template(
     payload: dict,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> dict:
     from app.social.polish import SocialPolishService
 
@@ -871,9 +869,9 @@ def create_template(
 def update_template(
     template_id: uuid.UUID,
     payload: dict,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> dict:
     from app.social.polish import SocialPolishService
 
@@ -885,9 +883,9 @@ def update_template(
 @router.delete("/templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_template(
     template_id: uuid.UUID,
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> Response:
     from app.social.polish import SocialPolishService
 
@@ -897,9 +895,9 @@ def delete_template(
 
 @router.get("/dashboard/stats")
 def dashboard_stats(
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> dict:
     from app.social.polish import SocialPolishService
 
@@ -909,9 +907,9 @@ def dashboard_stats(
 @router.get("/activity")
 def activity_feed(
     limit: int = Query(default=10, ge=1, le=50),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> list[dict]:
     from app.social.polish import SocialPolishService
 
@@ -920,9 +918,9 @@ def activity_feed(
 
 @router.get("/recommendations")
 def recommendations(
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
 ) -> list[dict]:
     from app.social.polish import SocialPolishService
 
@@ -931,10 +929,10 @@ def recommendations(
 
 @router.post("/posts/{post_id}/submit-approval", response_model=SocialPostOut)
 def submit_approval(
-    post: SocialPost = Depends(get_social_post_or_404),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     from app.social.polish import SocialPolishService
 
@@ -944,10 +942,10 @@ def submit_approval(
 
 @router.post("/posts/{post_id}/approve", response_model=SocialPostOut)
 def approve_post(
-    post: SocialPost = Depends(get_social_post_or_404),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     from app.social.polish import SocialPolishService
 
@@ -958,10 +956,10 @@ def approve_post(
 @router.post("/posts/{post_id}/reject", response_model=SocialPostOut)
 def reject_post(
     payload: Optional[dict] = Body(default=None),
-    post: SocialPost = Depends(get_social_post_or_404),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     from app.social.polish import SocialPolishService
 
@@ -973,10 +971,10 @@ def reject_post(
 @router.post("/posts/{post_id}/request-changes", response_model=SocialPostOut)
 def request_changes(
     payload: Optional[dict] = Body(default=None),
-    post: SocialPost = Depends(get_social_post_or_404),
-    workspace: Workspace = Depends(require_workspace_access),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    post: dict = Depends(get_social_post_or_404),
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> SocialPostOut:
     from app.social.polish import SocialPolishService
 
