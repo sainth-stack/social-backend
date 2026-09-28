@@ -21,7 +21,6 @@ FACEBOOK_SCOPES = [
     "pages_read_engagement",
     "pages_show_list",
     "pages_read_user_content",
-    "read_insights",
 ]
 
 
