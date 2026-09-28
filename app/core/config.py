@@ -84,14 +84,14 @@ class Settings(BaseSettings):
         default=None, validation_alias="BEDROCK_AWS_SECRET_ACCESS_KEY"
     )
     bedrock_image_model_id: str = Field(
-        default="amazon.nova-canvas-v1:0",
+        default="stability.sd3-5-large-v1:0",
         validation_alias="BEDROCK_IMAGE_MODEL_ID",
     )
     bedrock_image_quality: str = Field(
         default="premium",
         validation_alias="BEDROCK_IMAGE_QUALITY",
     )
-    # Nova Canvas / Titan image models — use us-east-1 (N. Virginia) in Model access
+    # Stability SD3.5 → usually us-west-2. Nova Canvas (Legacy) → us-east-1.
     bedrock_image_region: Optional[str] = Field(
         default=None,
         validation_alias="BEDROCK_IMAGE_REGION",
@@ -105,8 +105,16 @@ class Settings(BaseSettings):
 
     @property
     def resolved_bedrock_image_region(self) -> str:
-        """Image models (Nova Canvas). Must match Bedrock console region (typically us-east-1)."""
-        return (self.bedrock_image_region or self.bedrock_region or "us-east-1").strip()
+        """Region must match where the image model is enabled in Model access."""
+        explicit = (self.bedrock_image_region or "").strip()
+        if explicit:
+            return explicit
+        model = (self.bedrock_image_model_id or "stability.sd3-5-large-v1:0").strip()
+        if model.startswith("stability."):
+            return "us-west-2"
+        if "nova-canvas" in model.lower():
+            return "us-east-1"
+        return (self.bedrock_region or "us-west-2").strip()
 
     @property
     def resolved_bedrock_access_key_id(self) -> Optional[str]:
