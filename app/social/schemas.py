@@ -157,7 +157,7 @@ class UpdateSocialPostRequest(BaseModel):
 
 
 class RegeneratePostContentRequest(BaseModel):
-    prompt: Optional[str] = Field(default=None, max_length=2000)
+    prompt: Optional[str] = Field(default=None, max_length=8000)
     regenerateImage: bool = True
     regenerateCaption: bool = True
     tone: Optional[str] = Field(default=None, max_length=64)
@@ -384,8 +384,8 @@ class CalendarResponse(BaseModel):
 
 class ContentPlanGenerateRequest(BaseModel):
     days: int = Field(default=7, ge=1, le=30)
-    prompt: str = Field(default="", max_length=2000)
-    theme: Optional[str] = Field(default=None, max_length=500)  # legacy alias for prompt
+    prompt: str = Field(default="", max_length=16000)
+    theme: Optional[str] = Field(default=None, max_length=16000)  # legacy alias for prompt
     tone: Optional[str] = Field(default=None, max_length=64)
     cta: Optional[str] = Field(default=None, max_length=200)
     autoSchedule: bool = True
