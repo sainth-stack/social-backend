@@ -81,11 +81,12 @@ API on **5000**, frontend on **5001**. Frontend folder is auto-detected as
 `social-frontend` or `frontend` next to the backend repo.
 
 ```bash
-cp .env.production .env
 cd ../frontend && npm ci && npm run build && cd ../backend
 ./scripts/pm2-start.sh
 ./scripts/pm2-stop.sh
 ```
+
+Use the same `.env` file everywhere — edit values per machine (laptop vs EC2). There is no separate “production mode” in code.
 
 Point nginx at `127.0.0.1:5000` (API) and `127.0.0.1:5001` (frontend).
 

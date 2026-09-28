@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 if [[ ! -f "$ROOT/.env" ]]; then
-  echo "Missing .env — on EC2 copy: cp .env.production .env" >&2
+  echo "Missing .env — copy from .env.example and fill in values" >&2
   exit 1
 fi
 
