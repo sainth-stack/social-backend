@@ -30,7 +30,11 @@ from app.workspaces.models import WorkspacePlan
 
 logger = logging.getLogger(__name__)
 
-PUBLISHABLE = (SocialPlatform.FACEBOOK, SocialPlatform.INSTAGRAM)
+PUBLISHABLE = (
+    SocialPlatform.FACEBOOK,
+    SocialPlatform.INSTAGRAM,
+    SocialPlatform.LINKEDIN,
+)
 
 PLAN_DAY_CAP: dict[str, int] = {
     WorkspacePlan.STARTER.value: 7,
@@ -280,7 +284,7 @@ def _accounts_for_plan(
     if not allowed:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Select at least one platform: Facebook or Instagram.",
+            detail="Select at least one platform: Facebook, Instagram, or LinkedIn.",
         )
     filtered = [a for a in accounts if str(a.get("platform")) in allowed]
     if not filtered:
@@ -349,8 +353,7 @@ class ContentPlanService:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    "Connect a Facebook or Instagram account first. "
-                    "Auto-scheduling and posting require a publishable platform."
+                    "Connect Facebook, Instagram, or LinkedIn to generate and schedule posts."
                 ),
             )
 
@@ -417,8 +420,7 @@ class ContentPlanService:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    "Connect a Facebook or Instagram account first. "
-                    "Auto-scheduling and posting require a publishable platform."
+                    "Connect Facebook, Instagram, or LinkedIn to generate and schedule posts."
                 ),
             )
 
