@@ -546,6 +546,9 @@ class SocialMediaService:
         *,
         prompt: Optional[str] = None,
         regenerate_image: bool = True,
+        regenerate_caption: bool = True,
+        tone: Optional[str] = None,
+        cta: Optional[str] = None,
     ) -> SocialPostOut:
         from app.plans.service import record_ai_usage
         from app.social.ai.image_generator import generate_post_image
@@ -572,31 +575,45 @@ class SocialMediaService:
 
         settings = SocialPolishService(self.db).get_settings(workspace)
         brand_voice = self._brand_voice_dict(workspace["id"])
-        tone = settings.get("defaultTone") or ((brand_voice.get("tones") or ["Professional"])[0])
-        cta = settings.get("defaultCta") or None
+        tone = (
+            tone
+            or settings.get("defaultTone")
+            or ((brand_voice.get("tones") or ["Professional"])[0])
+        )
+        cta = cta or settings.get("defaultCta") or None
         audience = brand_voice.get("target_audience")
 
-        enforce_ai_text_limit(self.db, workspace)
-        record_ai_usage(self.db, workspace["id"], "text", user_id=user["id"])
-
-        result = generate_platform_content(
-            topic=topic,
-            tone=tone,
-            platforms=[platform.value],
-            audience=audience,
-            cta=cta,
-            include_hashtags=True,
-            include_comment=False,
-            brand_voice=brand_voice,
-        )
-        pc = result.get(platform.value) or {}
-        caption = (pc.get("caption") or "").strip()
-        hashtags = list(pc.get("hashtags") or [])
-        if not caption:
+        if not regenerate_caption and not regenerate_image:
             raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Regeneration produced empty caption",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Choose caption and/or image to regenerate",
             )
+
+        caption = (platform_row.get("caption") or "").strip()
+        hashtags = list(platform_row.get("hashtags") or [])
+
+        if regenerate_caption:
+            enforce_ai_text_limit(self.db, workspace)
+            record_ai_usage(self.db, workspace["id"], "text", user_id=user["id"])
+
+            result = generate_platform_content(
+                topic=topic,
+                tone=tone,
+                platforms=[platform.value],
+                audience=audience,
+                cta=cta,
+                include_hashtags=True,
+                include_comment=False,
+                brand_voice=brand_voice,
+            )
+            pc = result.get(platform.value) or {}
+            caption = (pc.get("caption") or "").strip()
+            hashtags = list(pc.get("hashtags") or [])
+            if not caption:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="Regeneration produced empty caption",
+                )
 
         update_kwargs: dict = {
             "platforms": [
@@ -611,13 +628,15 @@ class SocialMediaService:
         if prompt:
             update_kwargs["aiPrompt"] = prompt.strip()
 
+        image_caption_hint = caption[:180] if caption else topic[:180]
+
         if regenerate_image:
             try:
                 enforce_ai_image_limit(self.db, workspace)
                 record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"])
                 image_style = settings.get("imageGenerationStyle")
                 img_data = generate_post_image(
-                    topic=f"Social media image for: {caption[:180]}",
+                    topic=f"Social media image for: {image_caption_hint}",
                     style=image_style,
                     size="1024x1024",
                     mode="create",

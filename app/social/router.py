@@ -312,6 +312,9 @@ def regenerate_post_content(
         current_user,
         prompt=payload.prompt,
         regenerate_image=payload.regenerateImage,
+        regenerate_caption=payload.regenerateCaption,
+        tone=payload.tone,
+        cta=payload.cta,
     )
 
 

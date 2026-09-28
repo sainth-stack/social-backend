@@ -1,4 +1,4 @@
-"""Generate platform-native social post copy via OpenAI."""
+"""Generate platform-native social post copy via AWS Bedrock."""
 
 from __future__ import annotations
 
@@ -486,7 +486,13 @@ def _get_llm():
     """Return (client, model) or raise 503."""
     try:
         from app.providers.llm.factory import get_llm_client, get_llm_model
+
         return get_llm_client(), get_llm_model()
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

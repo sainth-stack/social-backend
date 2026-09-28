@@ -74,12 +74,36 @@ class Settings(BaseSettings):
     def resolved_celery_result_backend(self) -> str:
         return self.celery_result_backend or self.redis_url
 
-    # ── LLM — OpenAI ─────────────────────────────────────────────────────────
-    openai_api_key: Optional[str] = Field(default=None, validation_alias="OPENAI_API_KEY")
-    openai_base_url: str = Field(default="https://api.openai.com/v1", validation_alias="OPENAI_BASE_URL")
-    openai_deployment: str = Field(default="gpt-4o-mini", validation_alias="OPENAI_DEPLOYMENT")
-    openai_image_deployment: str = Field(default="dall-e-3", validation_alias="OPENAI_IMAGE_DEPLOYMENT")
+    # ── LLM — AWS Bedrock ─────────────────────────────────────────────────────
+    bedrock_model_id: str = Field(default="", validation_alias="BEDROCK_MODEL_ID")
+    bedrock_region: Optional[str] = Field(default=None, validation_alias="BEDROCK_REGION")
+    bedrock_aws_access_key_id: Optional[str] = Field(
+        default=None, validation_alias="BEDROCK_AWS_ACCESS_KEY_ID"
+    )
+    bedrock_aws_secret_access_key: Optional[str] = Field(
+        default=None, validation_alias="BEDROCK_AWS_SECRET_ACCESS_KEY"
+    )
+    bedrock_image_model_id: str = Field(
+        default="amazon.nova-canvas-v1:0",
+        validation_alias="BEDROCK_IMAGE_MODEL_ID",
+    )
+    bedrock_image_quality: str = Field(
+        default="premium",
+        validation_alias="BEDROCK_IMAGE_QUALITY",
+    )
     video_generation_enabled: bool = Field(default=False, validation_alias="VIDEO_GENERATION_ENABLED")
+
+    @property
+    def resolved_bedrock_region(self) -> str:
+        return (self.bedrock_region or self.aws_region or "us-east-1").strip()
+
+    @property
+    def resolved_bedrock_access_key_id(self) -> Optional[str]:
+        return self.bedrock_aws_access_key_id or self.aws_access_key_id
+
+    @property
+    def resolved_bedrock_secret_access_key(self) -> Optional[str]:
+        return self.bedrock_aws_secret_access_key or self.aws_secret_access_key
 
     # ── Object Storage — Amazon S3 ────────────────────────────────────────────
     aws_access_key_id: Optional[str] = Field(default=None, validation_alias="AWS_ACCESS_KEY_ID")

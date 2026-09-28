@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
@@ -103,9 +103,12 @@ def build_posting_slots(
     blackout_dates: list[Any] | None,
     queue_gap_minutes: int = 30,
     start: Optional[datetime] = None,
+    start_day_offset: int = 0,
 ) -> list[datetime]:
     tz = _tz(timezone_name)
     now_local = (start or datetime.now(timezone.utc)).astimezone(tz)
+    if start_day_offset > 0:
+        now_local = now_local + timedelta(days=start_day_offset)
     times_map = posting_times or DEFAULT_POSTING_TIMES
     blackouts = {str(d)[:10] for d in (blackout_dates or []) if d}
     gap = max(15, int(queue_gap_minutes or 30))
@@ -173,6 +176,47 @@ def build_posting_slots(
             ),
         )
     return slots
+
+
+def build_slot_for_plan_date(
+    *,
+    target: date,
+    timezone_name: str,
+    posting_times: dict[str, Any] | None,
+) -> datetime:
+    """One scheduled UTC slot on a specific calendar date (workspace timezone)."""
+    tz = _tz(timezone_name)
+    now_local = datetime.now(timezone.utc).astimezone(tz)
+    if target < now_local.date():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="targetDate must be today or a future date",
+        )
+    times_map = posting_times or DEFAULT_POSTING_TIMES
+    key = WEEKDAY_KEYS[target.weekday()]
+    raw_times = times_map.get(key) or ["10:00"]
+    if isinstance(raw_times, str):
+        raw_times = [raw_times]
+
+    chosen: Optional[datetime] = None
+    for t in raw_times:
+        try:
+            hh, mm = str(t).split(":")[:2]
+            local_dt = datetime(
+                target.year, target.month, target.day, int(hh), int(mm), tzinfo=tz
+            )
+        except (ValueError, TypeError):
+            continue
+        if local_dt > now_local + timedelta(minutes=5):
+            chosen = local_dt
+            break
+
+    if chosen is None:
+        chosen = datetime(target.year, target.month, target.day, 10, 0, tzinfo=tz)
+        if chosen <= now_local + timedelta(minutes=5):
+            chosen = now_local + timedelta(hours=1)
+
+    return chosen.astimezone(timezone.utc)
 
 
 def _connected_publishable(db: Database, workspace_id: str) -> list[dict]:
@@ -304,13 +348,32 @@ class ContentPlanService:
 
         settings = SocialPolishService(self.db).get_settings(workspace)
         tz_name = settings.get("timezone") or "UTC"
-        slots = build_posting_slots(
-            days=days,
-            timezone_name=tz_name,
-            posting_times=settings.get("defaultPostingTimes"),
-            blackout_dates=settings.get("blackoutDates"),
-            queue_gap_minutes=int(settings.get("queueGapMinutes") or 30),
-        )
+
+        if getattr(payload, "targetDate", None):
+            try:
+                target = date.fromisoformat(str(payload.targetDate).strip()[:10])
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="targetDate must be YYYY-MM-DD",
+                ) from exc
+            slots = [
+                build_slot_for_plan_date(
+                    target=target,
+                    timezone_name=tz_name,
+                    posting_times=settings.get("defaultPostingTimes"),
+                )
+            ]
+            days = 1
+        else:
+            slots = build_posting_slots(
+                days=days,
+                timezone_name=tz_name,
+                posting_times=settings.get("defaultPostingTimes"),
+                blackout_dates=settings.get("blackoutDates"),
+                queue_gap_minutes=int(settings.get("queueGapMinutes") or 30),
+                start_day_offset=max(0, int(getattr(payload, "startDayOffset", 0) or 0)),
+            )
 
         social = SocialMediaService(self.db)
         brand = social._brand_voice_dict(workspace["id"])

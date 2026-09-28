@@ -1,9 +1,7 @@
-"""AI image generation via OpenAI (dall-e-3 / gpt-image-2)."""
+"""AI image generation via AWS Bedrock (Nova Canvas)."""
 
 from __future__ import annotations
 
-import base64
-import io
 import logging
 from typing import Literal, Optional
 
@@ -11,6 +9,11 @@ import httpx
 from fastapi import HTTPException, status
 
 from app.core.config import settings
+from app.providers.llm.bedrock_image import (
+    generate_image_variation,
+    generate_text_to_image,
+    image_generation_configured,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,48 +21,26 @@ ImageGenerationMode = Literal["create", "edit"]
 
 
 def _build_create_prompt(topic: str, style: Optional[str]) -> str:
-    """Elevate any brief into a scroll-stopping, commercial-quality social image."""
     style_line = style or (
-        "premium modern brand photography / clean product-marketing aesthetic, "
-        "soft cinematic lighting, shallow depth of field when natural, "
-        "high contrast, polished color grade"
+        "premium modern brand photography, clean product-marketing aesthetic, "
+        "soft cinematic lighting, high contrast, polished color grade"
     )
     return (
-        "Create a single, scroll-stopping social media marketing image. "
-        "It must look expensive, professional, and ready for Instagram/LinkedIn ads — "
-        "not clip-art, not generic stock, not cartoonish unless the brief demands it.\n"
-        f"Subject / brief (interpret creatively and elevate): {topic}\n"
-        f"Visual style: {style_line}\n"
-        "Composition: strong focal point, rule of thirds or bold centered hero, "
-        "negative space for optional future text, square-friendly framing.\n"
-        "Mood: trustworthy, aspirational, conversion-ready — makes the viewer want the product/service.\n"
-        "Strict: no watermarks, no logos unless described, no unreadable fake UI text, "
-        "no typography overlays, no garbled letters, no collage clutter."
+        "Professional social media marketing image, scroll-stopping, ad-ready for "
+        "Instagram and LinkedIn. Not clip-art, not cartoon unless the brief requires it. "
+        f"Subject: {topic}. Visual style: {style_line}. "
+        "Strong focal point, square-friendly composition, negative space for optional text. "
+        "No watermarks, no logos unless described, no readable text overlays, no garbled letters."
     )
 
 
 def _build_edit_prompt(topic: str, style: Optional[str]) -> str:
     return (
-        "Edit this social media marketing image with a premium commercial finish.\n"
-        f"Requested change: {topic}\n"
-        "Keep composition coherent and brand-safe. "
-        f"Style notes: {style or 'modern, minimal, professional, high-end lighting'}.\n"
-        "No watermarks, no garbled text overlays."
+        "Refine this social marketing image with a premium commercial finish. "
+        f"Change: {topic}. "
+        f"Style: {style or 'modern, minimal, professional, high-end lighting'}. "
+        "Keep composition brand-safe. No watermarks, no garbled text."
     )
-
-
-def _decode_image_result(result) -> dict[str, str | bytes]:
-    if not result.data:
-        raise RuntimeError("No image data returned from gpt-image-2")
-
-    item = result.data[0]
-    b64 = getattr(item, "b64_json", None)
-    if b64:
-        return {"imageB64": base64.b64decode(b64), "source": "ai_generated"}
-    url = getattr(item, "url", None)
-    if url:
-        return {"imageUrl": url, "source": "ai_generated"}
-    raise RuntimeError("gpt-image-2 returned neither b64_json nor url")
 
 
 def _download_source_image(url: str) -> bytes:
@@ -75,28 +56,6 @@ def _download_source_image(url: str) -> bytes:
         ) from exc
 
 
-def _generate_create(client, *, model: str, prompt: str, size: str):
-    """OpenAI Images API create call."""
-    try:
-        return client.images.generate(
-            model=model,
-            prompt=prompt,
-            n=1,
-            size=size,
-        )
-    except Exception as first_exc:
-        try:
-            return client.images.generate(
-                model=model,
-                prompt=prompt,
-                n=1,
-                size=size,
-                response_format="b64_json",
-            )
-        except Exception:
-            raise first_exc from None
-
-
 def generate_post_image(
     *,
     topic: str,
@@ -105,12 +64,12 @@ def generate_post_image(
     mode: ImageGenerationMode = "create",
     source_image_bytes: Optional[bytes] = None,
 ) -> dict[str, str | bytes]:
-    """Generate or edit an image for a social post via OpenAI image API."""
-    if not settings.openai_api_key:
+    if not image_generation_configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "Image generation is not configured. Set OPENAI_API_KEY, or upload an image instead."
+                "AI image generation is not configured. Set BEDROCK_IMAGE_MODEL_ID and "
+                "Bedrock credentials, or upload an image instead."
             ),
         )
 
@@ -120,60 +79,43 @@ def generate_post_image(
             detail="Source image is required to refine an existing image",
         )
 
-    try:
-        from app.providers.llm.factory import get_image_client
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Image generation is not available",
-        ) from exc
-
-    from app.core.config import settings as _s
-    model = _s.openai_image_deployment  # dall-e-3 or gpt-image-2
+    model_id = settings.bedrock_image_model_id or "amazon.nova-canvas-v1:0"
+    quality = settings.bedrock_image_quality or "premium"
 
     try:
-        client = get_image_client()
-
         if mode == "edit":
             prompt = _build_edit_prompt(topic, style)
-            image_file = io.BytesIO(source_image_bytes)
-            image_file.name = "source.png"
-            try:
-                result = client.images.edit(
-                    model=model,
-                    image=image_file,
-                    prompt=prompt,
-                    size=size,
-                    n=1,
-                )
-            except TypeError:
-                # Older SDK keyword set
-                image_file.seek(0)
-                result = client.images.edit(
-                    model=model,
-                    image=image_file,
-                    prompt=prompt,
-                    size=size,
-                    n=1,
-                    response_format="b64_json",
-                )
+            image_bytes = generate_image_variation(
+                prompt=prompt,
+                source_image_bytes=source_image_bytes,
+                size=size,
+                quality=quality,
+            )
         else:
             prompt = _build_create_prompt(topic, style)
-            result = _generate_create(client, model=model, prompt=prompt, size=size)
-
-        return _decode_image_result(result)
+            image_bytes = generate_text_to_image(
+                prompt=prompt,
+                size=size,
+                quality=quality,
+            )
+        return {"imageB64": image_bytes, "source": "ai_generated"}
 
     except HTTPException:
         raise
+    except RuntimeError as exc:
+        logger.warning("Bedrock image generation failed model=%s: %s", model_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
     except Exception as exc:
         logger.warning("Image generation failed: %s", exc)
         action = "refinement" if mode == "edit" else "generation"
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                f"Image {action} failed (model={model}). "
-                "Check OPENAI_API_KEY and OPENAI_IMAGE_DEPLOYMENT. "
-                "You can also upload an image instead."
+                f"Image {action} failed (model={model_id}). Enable the model in Bedrock "
+                f"({settings.resolved_bedrock_region}) or upload an image instead."
             ),
         ) from exc
 

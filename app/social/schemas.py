@@ -159,6 +159,9 @@ class UpdateSocialPostRequest(BaseModel):
 class RegeneratePostContentRequest(BaseModel):
     prompt: Optional[str] = Field(default=None, max_length=2000)
     regenerateImage: bool = True
+    regenerateCaption: bool = True
+    tone: Optional[str] = Field(default=None, max_length=64)
+    cta: Optional[str] = Field(default=None, max_length=200)
 
 
 class SocialPostListParams(BaseModel):
@@ -388,6 +391,12 @@ class ContentPlanGenerateRequest(BaseModel):
     autoSchedule: bool = True
     generateImages: bool = False
     skipFilledDays: bool = True
+    startDayOffset: int = Field(default=0, ge=0, le=29)
+    targetDate: Optional[str] = Field(
+        default=None,
+        max_length=10,
+        description="Generate one post for this date (YYYY-MM-DD). Overrides days.",
+    )
 
 
 class ContentPlanJobStartResponse(BaseModel):

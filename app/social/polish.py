@@ -8,6 +8,7 @@ from typing import Any, Optional
 from fastapi import HTTPException, status
 from pymongo.database import Database
 
+from app.core.config import settings
 from app.core.mongo_utils import new_id, utcnow
 from app.social.audit import write_social_audit
 from app.social.limits import (
@@ -704,7 +705,7 @@ class SocialPolishService:
                 "hashtag_count": 5,
                 "auto_first_comment": False,
                 "image_generation_style": "Photographic",
-                "openai_model": "gpt-4o-mini",
+                "openai_model": settings.bedrock_model_id or "amazon.nova-micro-v1:0",
                 "system_prompt_override": None,
                 "enabled_platforms": DEFAULT_ENABLED_PLATFORMS,
                 "notification_events": DEFAULT_NOTIFICATION_EVENTS,
@@ -728,7 +729,7 @@ class SocialPolishService:
             "hashtag_count": 5,
             "auto_first_comment": False,
             "image_generation_style": "Photographic",
-            "openai_model": "gpt-4o-mini",
+            "openai_model": settings.bedrock_model_id or "amazon.nova-micro-v1:0",
             "system_prompt_override": None,
             "enabled_platforms": dict(DEFAULT_ENABLED_PLATFORMS),
             "notification_events": dict(DEFAULT_NOTIFICATION_EVENTS),
@@ -757,7 +758,7 @@ class SocialPolishService:
             "hashtagCount": r.get("hashtag_count") or 5,
             "autoFirstComment": bool(r.get("auto_first_comment")),
             "imageGenerationStyle": r.get("image_generation_style") or "Photographic",
-            "openaiModel": r.get("openai_model") or "gpt-4o-mini",
+            "openaiModel": r.get("openai_model") or settings.bedrock_model_id or "amazon.nova-micro-v1:0",
             "systemPromptOverride": r.get("system_prompt_override"),
             "enabledPlatforms": r.get("enabled_platforms") or DEFAULT_ENABLED_PLATFORMS,
             "notificationEvents": r.get("notification_events") or DEFAULT_NOTIFICATION_EVENTS,
