@@ -91,11 +91,22 @@ class Settings(BaseSettings):
         default="premium",
         validation_alias="BEDROCK_IMAGE_QUALITY",
     )
+    # Nova Canvas / Titan image models — use us-east-1 (N. Virginia) in Model access
+    bedrock_image_region: Optional[str] = Field(
+        default=None,
+        validation_alias="BEDROCK_IMAGE_REGION",
+    )
     video_generation_enabled: bool = Field(default=False, validation_alias="VIDEO_GENERATION_ENABLED")
 
     @property
     def resolved_bedrock_region(self) -> str:
-        return (self.bedrock_region or self.aws_region or "us-east-1").strip()
+        """Text models (Converse). Default us-east-1 — not S3 region."""
+        return (self.bedrock_region or "us-east-1").strip()
+
+    @property
+    def resolved_bedrock_image_region(self) -> str:
+        """Image models (Nova Canvas). Must match Bedrock console region (typically us-east-1)."""
+        return (self.bedrock_image_region or self.bedrock_region or "us-east-1").strip()
 
     @property
     def resolved_bedrock_access_key_id(self) -> Optional[str]:

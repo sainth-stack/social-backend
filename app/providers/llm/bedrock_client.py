@@ -125,8 +125,8 @@ class BedrockChatClient:
         self.chat = _Chat(runtime, model_id)
 
 
-@lru_cache(maxsize=1)
-def get_bedrock_runtime_client() -> Any:
+@lru_cache(maxsize=4)
+def get_bedrock_runtime_client(*, region_name: str | None = None) -> Any:
     try:
         import boto3
     except ImportError as exc:
@@ -140,9 +140,10 @@ def get_bedrock_runtime_client() -> Any:
             "Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or BEDROCK_AWS_*."
         )
 
+    region = (region_name or settings.resolved_bedrock_region).strip()
     return boto3.client(
         "bedrock-runtime",
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
-        region_name=settings.resolved_bedrock_region,
+        region_name=region,
     )

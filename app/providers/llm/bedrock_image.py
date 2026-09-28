@@ -47,7 +47,8 @@ def _parse_size(size: str) -> tuple[int, int]:
 
 def _invoke_image_model(body: dict[str, Any], *, model_id: str | None = None) -> list[str]:
     model = model_id or _resolved_image_model_id()
-    runtime = get_bedrock_runtime_client()
+    region = settings.resolved_bedrock_image_region
+    runtime = get_bedrock_runtime_client(region_name=region)
     try:
         response = runtime.invoke_model(
             modelId=model,
@@ -56,8 +57,15 @@ def _invoke_image_model(body: dict[str, Any], *, model_id: str | None = None) ->
             accept="application/json",
         )
     except (ClientError, BotoCoreError) as exc:
-        logger.warning("Bedrock image invoke failed model=%s: %s", model, exc)
-        raise RuntimeError(f"Bedrock image generation failed: {exc}") from exc
+        logger.warning(
+            "Bedrock image invoke failed model=%s region=%s: %s",
+            model,
+            region,
+            exc,
+        )
+        raise RuntimeError(
+            f"Bedrock image generation failed ({region}, {model}): {exc}"
+        ) from exc
 
     payload = json.loads(response["body"].read())
     images = payload.get("images") or []
