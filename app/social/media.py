@@ -22,8 +22,9 @@ from app.providers.storage.factory import get_storage_provider
 
 logger = logging.getLogger(__name__)
 
-# Instagram needs to fetch the media; keep presigned URLs valid for scheduled posts.
-_SAS_EXPIRES_SECONDS = 60 * 60 * 24 * 30  # 30 days
+# AWS SigV4 presigned GET URLs: X-Amz-Expires must be < 604800 (7 days).
+_SAS_EXPIRES_SECONDS = 604800
+_MAX_PRESIGN_EXPIRES_SECONDS = 604800
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024    # 8 MB
 _MAX_LOGO_BYTES = 5 * 1024 * 1024     # 5 MB
 _MAX_VIDEO_BYTES = 200 * 1024 * 1024  # 200 MB
@@ -87,6 +88,19 @@ def _is_our_storage_url(url: str) -> bool:
 def _public_url_for_key(key: str) -> str:
     storage = get_storage_provider()
     return storage.presigned_get_url(key, expires_in=_SAS_EXPIRES_SECONDS)
+
+
+def resolve_stored_image_url(image_url: Optional[str]) -> Optional[str]:
+    """Return a fresh presigned URL for our S3 objects (for UI and platform fetch)."""
+    if not image_url or not str(image_url).strip():
+        return None
+    url = str(image_url).strip()
+    if not _is_our_storage_url(url):
+        return url
+    key = blob_key_from_url(url)
+    if not key:
+        return url
+    return _public_url_for_key(key)
 
 
 def upload_social_image_bytes(
@@ -275,7 +289,8 @@ def ensure_public_image_url(
         )
 
     if _is_our_blob_url(url) and not force_reupload:
-        return url
+        refreshed = resolve_stored_image_url(url)
+        return refreshed or url
 
     # Re-host so scheduled posts still work if the source URL expires.
     return _upload_remote_url(workspace_id, url)

@@ -907,6 +907,8 @@ class SocialMediaService:
         )
 
         items: list[CalendarPostOut] = []
+        from app.social.media import resolve_stored_image_url
+
         for post in rows:
             platforms = _get_post_platforms(self.db, post["id"])
             preview = ""
@@ -927,7 +929,7 @@ class SocialMediaService:
                     publishedAt=_iso(post.get("published_at")),
                     platforms=platform_list,
                     captionPreview=preview or post.get("title") or "",
-                    imageUrl=post.get("image_url"),
+                    imageUrl=resolve_stored_image_url(post.get("image_url")),
                 )
             )
         return CalendarResponse(month=month, items=items)
@@ -1696,6 +1698,8 @@ class SocialMediaService:
         )
 
     def _serialize_post(self, post: dict) -> SocialPostOut:
+        from app.social.media import resolve_stored_image_url
+
         platforms = _get_post_platforms(self.db, post["id"])
         platform_outs = [
             SocialPostPlatformOut(
@@ -1735,7 +1739,7 @@ class SocialMediaService:
             approvedBy=str(post["approved_by"]) if post.get("approved_by") else None,
             templateId=str(post["template_id"]) if post.get("template_id") else None,
             aiPrompt=post.get("ai_prompt"),
-            imageUrl=post.get("image_url"),
+            imageUrl=resolve_stored_image_url(post.get("image_url")),
             imageSource=post.get("image_source", SocialImageSource.NONE.value),
             platforms=platform_outs,
             createdAt=_iso(post.get("created_at")) or "",

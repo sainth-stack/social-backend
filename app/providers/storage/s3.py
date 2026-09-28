@@ -157,11 +157,12 @@ class S3StorageProvider(ObjectStorageProvider):
     ) -> str:
         bucket_name = bucket or self._bucket
         full_key = self._full_key(key)
+        safe_expires = max(1, min(int(expires_in), 604800))
         try:
             return _client().generate_presigned_url(
                 "get_object",
                 Params={"Bucket": bucket_name, "Key": full_key},
-                ExpiresIn=expires_in,
+                ExpiresIn=safe_expires,
             )
         except (ClientError, BotoCoreError) as exc:
             raise HTTPException(
