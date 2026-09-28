@@ -478,17 +478,36 @@ def get_content_plan_job(
                 status="failed",
                 error=str(payload.get("error")),
             )
+        try:
+            plan_result = ContentPlanGenerateResponse.model_validate(payload)
+        except Exception as exc:
+            from pydantic import ValidationError
+
+            from app.social.tasks.task_errors import format_task_exception
+
+            detail = (
+                format_task_exception(exc)
+                if isinstance(exc, ValidationError)
+                else str(exc) or "Invalid content plan result"
+            )
+            logger.error("content plan job %s result invalid: %s", job_id, detail)
+            return ContentPlanJobStatusResponse(
+                jobId=job_id,
+                status="failed",
+                error=detail,
+            )
         return ContentPlanJobStatusResponse(
             jobId=job_id,
             status="completed",
-            result=ContentPlanGenerateResponse.model_validate(payload),
+            result=plan_result,
         )
     if state == "FAILURE":
-        err = result.result
+        from app.social.tasks.task_errors import celery_failure_message
+
         return ContentPlanJobStatusResponse(
             jobId=job_id,
             status="failed",
-            error=str(err) if err else "Content plan job failed",
+            error=celery_failure_message(result, fallback="Content plan job failed"),
         )
     return ContentPlanJobStatusResponse(jobId=job_id, status=state.lower())
 

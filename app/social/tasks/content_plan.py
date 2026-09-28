@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import logging
 
+from fastapi import HTTPException
+from pydantic import ValidationError
+
 from app.core.database import get_database
 from app.social.content_plan import ContentPlanService
 from app.social.schemas import ContentPlanGenerateRequest
+from app.social.tasks.task_errors import format_task_exception
 from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -31,7 +35,12 @@ def generate_content_plan_task(
     if not workspace or not user:
         return {"error": "workspace_or_user_not_found"}
 
-    request = ContentPlanGenerateRequest.model_validate(payload)
+    try:
+        request = ContentPlanGenerateRequest.model_validate(payload)
+    except ValidationError as exc:
+        msg = format_task_exception(exc)
+        logger.error("content plan payload invalid workspace=%s: %s", workspace_id, msg)
+        return {"error": msg}
     total = min(int(request.days), 30)
 
     def progress(current: int, total_days: int, message: str) -> None:
@@ -49,6 +58,15 @@ def generate_content_plan_task(
             workspace, user, request, progress_callback=progress
         )
         return result.model_dump(mode="json")
+    except HTTPException as exc:
+        msg = format_task_exception(exc)
+        logger.warning("generate_content_plan_task rejected workspace=%s: %s", workspace_id, msg)
+        return {"error": msg}
+    except ValidationError as exc:
+        msg = format_task_exception(exc)
+        logger.exception("generate_content_plan_task validation workspace=%s: %s", workspace_id, msg)
+        return {"error": msg}
     except Exception as exc:
-        logger.exception("generate_content_plan_task failed workspace=%s", workspace_id)
-        raise exc
+        msg = format_task_exception(exc)
+        logger.exception("generate_content_plan_task failed workspace=%s: %s", workspace_id, msg)
+        raise RuntimeError(msg) from exc

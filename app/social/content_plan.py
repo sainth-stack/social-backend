@@ -296,13 +296,28 @@ class ContentPlanService:
 
         settings = SocialPolishService(self.db).get_settings(workspace)
         tz_name = settings.get("timezone") or "UTC"
-        build_posting_slots(
-            days=days,
-            timezone_name=tz_name,
-            posting_times=settings.get("defaultPostingTimes"),
-            blackout_dates=settings.get("blackoutDates"),
-            queue_gap_minutes=int(settings.get("queueGapMinutes") or 30),
-        )
+        if getattr(payload, "targetDate", None):
+            try:
+                target = date.fromisoformat(str(payload.targetDate).strip()[:10])
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="targetDate must be YYYY-MM-DD",
+                ) from exc
+            build_slot_for_plan_date(
+                target=target,
+                timezone_name=tz_name,
+                posting_times=settings.get("defaultPostingTimes"),
+            )
+        else:
+            build_posting_slots(
+                days=days,
+                timezone_name=tz_name,
+                posting_times=settings.get("defaultPostingTimes"),
+                blackout_dates=settings.get("blackoutDates"),
+                queue_gap_minutes=int(settings.get("queueGapMinutes") or 30),
+                start_day_offset=max(0, int(getattr(payload, "startDayOffset", 0) or 0)),
+            )
 
         user_prompt = _resolve_plan_prompt(payload)
         if len(user_prompt) < 10:
