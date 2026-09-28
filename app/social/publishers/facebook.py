@@ -146,3 +146,44 @@ class FacebookPublisher(BasePublisher):
             error_message=message,
             retryable=retryable,
         )
+
+    def delete_remote(
+        self,
+        *,
+        platform_post_id: str,
+        platform_account_id: str,
+        access_token: str,
+    ) -> PublishResult:
+        _ = platform_account_id
+        post_id = (platform_post_id or "").strip()
+        if not post_id:
+            return PublishResult(
+                success=False,
+                error_code="INVALID_CONTENT",
+                error_message="Missing Facebook post id",
+                retryable=False,
+            )
+        url = f"https://graph.facebook.com/{self.api_version}/{post_id}"
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                response = client.delete(url, params={"access_token": access_token})
+                response.raise_for_status()
+                data = response.json()
+            if data.get("success") is False:
+                return PublishResult(
+                    success=False,
+                    error_code="API_ERROR",
+                    error_message="Facebook did not confirm delete",
+                    retryable=True,
+                )
+            return PublishResult(success=True, platform_post_id=post_id)
+        except httpx.HTTPStatusError as exc:
+            return self._http_error(exc)
+        except Exception as exc:
+            logger.exception("Facebook delete failed: %s", exc)
+            return PublishResult(
+                success=False,
+                error_code="API_ERROR",
+                error_message=str(exc),
+                retryable=True,
+            )

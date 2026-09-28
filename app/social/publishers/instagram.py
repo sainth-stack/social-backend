@@ -170,3 +170,44 @@ class InstagramPublisher(BasePublisher):
             error_message=message,
             retryable=retryable,
         )
+
+    def delete_remote(
+        self,
+        *,
+        platform_post_id: str,
+        platform_account_id: str,
+        access_token: str,
+    ) -> PublishResult:
+        _ = platform_account_id
+        media_id = (platform_post_id or "").strip()
+        if not media_id:
+            return PublishResult(
+                success=False,
+                error_code="INVALID_CONTENT",
+                error_message="Missing Instagram media id",
+                retryable=False,
+            )
+        url = f"{self.graph_host}/{self.api_version}/{media_id}"
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                response = client.delete(url, params={"access_token": access_token})
+                response.raise_for_status()
+                data = response.json()
+            if data.get("success") is False:
+                return PublishResult(
+                    success=False,
+                    error_code="API_ERROR",
+                    error_message="Instagram did not confirm delete",
+                    retryable=True,
+                )
+            return PublishResult(success=True, platform_post_id=media_id)
+        except httpx.HTTPStatusError as exc:
+            return self._http_error(exc)
+        except Exception as exc:
+            logger.exception("Instagram delete failed: %s", exc)
+            return PublishResult(
+                success=False,
+                error_code="API_ERROR",
+                error_message=str(exc),
+                retryable=True,
+            )

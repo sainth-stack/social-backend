@@ -667,7 +667,7 @@ class SocialMediaService:
 
         return self.update_post(post, workspace, UpdateSocialPostRequest(**update_kwargs))
 
-    def delete_post(self, post: dict) -> None:
+    def delete_post(self, post: dict, *, delete_from_platforms: bool = True) -> None:
         post_id = str(post["id"])
         fresh = self.db["social_posts"].find_one({"id": post_id})
         if not fresh:
@@ -679,6 +679,9 @@ class SocialMediaService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Cannot delete while the post is publishing — try again in a moment",
             )
+
+        if delete_from_platforms:
+            self._remove_post_from_platforms(post_id, fresh.get("workspace_id"))
 
         if status == SocialPostStatus.SCHEDULED.value:
             self.db["social_posts"].update_one(
@@ -707,6 +710,77 @@ class SocialMediaService:
 
         self.db["social_post_platforms"].delete_many({"post_id": post_id})
         self.db["social_posts"].delete_one({"id": post_id})
+
+    def _remove_post_from_platforms(self, post_id: str, workspace_id: str | None) -> None:
+        from app.social.audit import write_social_audit
+        from app.social.publishers.base import get_publisher
+
+        platforms = _get_post_platforms(self.db, post_id)
+        now = datetime.now(timezone.utc)
+        for pp in platforms:
+            if pp.get("status") != SocialPlatformPostStatus.PUBLISHED.value:
+                continue
+            platform_post_id = (pp.get("platform_post_id") or "").strip()
+            if not platform_post_id:
+                continue
+            platform_str = pp.get("platform") or ""
+            try:
+                platform_enum = SocialPlatform(platform_str)
+            except ValueError:
+                continue
+            if platform_enum not in PUBLISHABLE_PLATFORMS:
+                continue
+            account = self.db["social_accounts"].find_one({"id": pp.get("social_account_id")})
+            if not account or not account.get("access_token_enc"):
+                logger.warning(
+                    "delete_post: no account to remove platform post post=%s platform=%s",
+                    post_id,
+                    platform_str,
+                )
+                continue
+            token_expires = account.get("token_expires_at")
+            if token_expires:
+                if token_expires.tzinfo is None:
+                    token_expires = token_expires.replace(tzinfo=timezone.utc)
+                if token_expires <= now:
+                    logger.warning(
+                        "delete_post: token expired, skipping remote delete post=%s platform=%s",
+                        post_id,
+                        platform_str,
+                    )
+                    continue
+            token = decrypt(account["access_token_enc"])
+            try:
+                publisher = get_publisher(platform_enum)
+                result = publisher.delete_remote(
+                    platform_post_id=platform_post_id,
+                    platform_account_id=account.get("platform_account_id") or "",
+                    access_token=token,
+                )
+            except ValueError:
+                continue
+            write_social_audit(
+                self.db,
+                workspace_id=str(workspace_id or account.get("workspace_id") or ""),
+                action="post.platform_delete"
+                if result.success
+                else "post.platform_delete_failed",
+                entity_id=post_id,
+                metadata={
+                    "post_id": post_id,
+                    "platform": platform_str,
+                    "platform_post_id": platform_post_id,
+                    "error_code": result.error_code,
+                    "error_message": result.error_message,
+                },
+            )
+            if not result.success:
+                logger.warning(
+                    "delete_post: remote delete failed post=%s platform=%s: %s",
+                    post_id,
+                    platform_str,
+                    result.error_message,
+                )
 
     def schedule_post(self, post: dict, payload: SchedulePostRequest) -> SocialPostOut:
         platforms = _get_post_platforms(self.db, post["id"])

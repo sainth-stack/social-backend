@@ -34,6 +34,22 @@ class BasePublisher(ABC):
     ) -> PublishResult:
         """Publish content to the platform and return the result."""
 
+    def delete_remote(
+        self,
+        *,
+        platform_post_id: str,
+        platform_account_id: str,
+        access_token: str,
+    ) -> PublishResult:
+        """Remove a published post from the platform (best-effort)."""
+        _ = platform_post_id, platform_account_id, access_token
+        return PublishResult(
+            success=False,
+            error_code="UNSUPPORTED_PLATFORM",
+            error_message="Remote delete is not supported for this platform",
+            retryable=False,
+        )
+
 
 def get_publisher(platform: SocialPlatform | str) -> BasePublisher:
     from app.social.publishers.facebook import FacebookPublisher

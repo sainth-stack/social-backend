@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -117,3 +118,49 @@ class LinkedInPublisher(BasePublisher):
             error_message=message,
             retryable=retryable,
         )
+
+    def delete_remote(
+        self,
+        *,
+        platform_post_id: str,
+        platform_account_id: str,
+        access_token: str,
+    ) -> PublishResult:
+        _ = platform_account_id
+        raw_id = (platform_post_id or "").strip()
+        if not raw_id:
+            return PublishResult(
+                success=False,
+                error_code="INVALID_CONTENT",
+                error_message="Missing LinkedIn post id",
+                retryable=False,
+            )
+        if raw_id.startswith("urn:li:"):
+            post_urn = raw_id
+        elif raw_id.startswith("ugcPost:"):
+            post_urn = f"urn:li:{raw_id}"
+        else:
+            post_urn = f"urn:li:ugcPost:{raw_id}"
+        encoded = quote(post_urn, safe="")
+        url = f"https://api.linkedin.com/rest/posts/{encoded}"
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                response = client.delete(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "X-Restli-Protocol-Version": "2.0.0",
+                        "LinkedIn-Version": "202401",
+                    },
+                )
+                if response.status_code >= 400:
+                    return self._error_result(response)
+            return PublishResult(success=True, platform_post_id=post_urn)
+        except httpx.HTTPError as exc:
+            logger.exception("LinkedIn delete failed: %s", exc)
+            return PublishResult(
+                success=False,
+                error_code="API_ERROR",
+                error_message=str(exc),
+                retryable=True,
+            )

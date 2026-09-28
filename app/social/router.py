@@ -321,10 +321,13 @@ def regenerate_post_content(
 @router.delete("/posts/{post_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_post(
     post: dict = Depends(get_social_post_or_404),
+    delete_from_platforms: bool = Query(True, alias="deleteFromPlatforms"),
     db: Database = Depends(get_db),
     _: dict = Depends(get_current_user),
 ) -> Response:
-    SocialMediaService(db).delete_post(post)
+    SocialMediaService(db).delete_post(
+        post, delete_from_platforms=delete_from_platforms
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
