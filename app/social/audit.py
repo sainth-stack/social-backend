@@ -7,6 +7,7 @@ from typing import Any, Optional
 from pymongo.database import Database
 
 from app.core.mongo_utils import new_id, utcnow
+from app.social.dashboard_cache import invalidate_dashboard
 
 
 def write_social_audit(
@@ -34,3 +35,4 @@ def write_social_audit(
             "created_at": utcnow(),
         }
     )
+    invalidate_dashboard(str(workspace_id))

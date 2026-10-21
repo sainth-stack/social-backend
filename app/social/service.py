@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 from fastapi import HTTPException, status
+from pymongo import ReturnDocument
 from pymongo.database import Database
 
 from app.core.encryption import decrypt, encrypt
@@ -49,6 +51,7 @@ from app.social.schemas import (
     MediaAssetListParams,
     MediaAssetListResponse,
     MediaAssetOut,
+    MediaAssetStats,
     SchedulePostRequest,
     SocialAccountOut,
     SocialPostListParams,
@@ -401,9 +404,15 @@ class SocialMediaService:
             .skip((page - 1) * page_size)
             .limit(page_size)
         )
+        platforms_by_post: dict[str, list[dict]] = {str(p["id"]): [] for p in rows}
+        if rows:
+            for pp in self.db["social_post_platforms"].find(
+                {"post_id": {"$in": list(platforms_by_post.keys())}}
+            ):
+                platforms_by_post.setdefault(str(pp.get("post_id")), []).append(pp)
 
         return SocialPostListResponse(
-            items=[self._serialize_post(p) for p in rows],
+            items=[self._serialize_post(p, platforms_by_post[str(p["id"])]) for p in rows],
             total=total,
             page=page,
             pageSize=page_size,
@@ -594,7 +603,6 @@ class SocialMediaService:
 
         if regenerate_caption:
             enforce_ai_text_limit(self.db, workspace)
-            record_ai_usage(self.db, workspace["id"], "text", user_id=user["id"])
 
             result = generate_platform_content(
                 topic=topic,
@@ -606,6 +614,7 @@ class SocialMediaService:
                 include_comment=False,
                 brand_voice=brand_voice,
             )
+            record_ai_usage(self.db, workspace["id"], "text", user_id=user["id"])
             pc = result.get(platform.value) or {}
             caption = (pc.get("caption") or "").strip()
             hashtags = list(pc.get("hashtags") or [])
@@ -633,7 +642,6 @@ class SocialMediaService:
         if regenerate_image:
             try:
                 enforce_ai_image_limit(self.db, workspace)
-                record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"])
                 image_style = settings.get("imageGenerationStyle")
                 img_data = generate_post_image(
                     topic=f"Social media image for: {image_caption_hint}",
@@ -641,6 +649,7 @@ class SocialMediaService:
                     size="1024x1024",
                     mode="create",
                 )
+                record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"])
                 upload = None
                 if img_data.get("imageB64"):
                     upload = upload_social_image_bytes(
@@ -1116,7 +1125,6 @@ class SocialMediaService:
         return self._serialize_brand_voice(row)
 
     def upsert_brand_voice(self, workspace: dict, payload: BrandVoiceUpdateRequest) -> BrandVoiceOut:
-        row = self._get_brand_voice_row(workspace["id"])
         now = utcnow()
         updates = {
             "brand_name": payload.brandName,
@@ -1135,15 +1143,12 @@ class SocialMediaService:
         }
         if payload.logoUrl is not None:
             updates["logo_url"] = payload.logoUrl.strip() or None
-        if not row:
-            doc = {"id": new_id(), "workspace_id": workspace["id"]}
-            doc.update(updates)
-            self.db["social_brand_voices"].insert_one(doc)
-        else:
-            self.db["social_brand_voices"].update_one(
-                {"workspace_id": workspace["id"]}, {"$set": updates}
-            )
-        row = self.db["social_brand_voices"].find_one({"workspace_id": workspace["id"]})
+        row = self.db["social_brand_voices"].find_one_and_update(
+            {"workspace_id": workspace["id"]},
+            {"$set": updates, "$setOnInsert": {"id": new_id()}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
         return self._serialize_brand_voice(row)
 
     def test_brand_voice(
@@ -1180,9 +1185,9 @@ class SocialMediaService:
         from app.plans.service import record_ai_usage
 
         enforce_ai_text_limit(self.db, workspace)
-        record_ai_usage(self.db, workspace["id"], "text")
 
         sample = generate_brand_voice_sample(brand_voice)
+        record_ai_usage(self.db, workspace["id"], "text")
         return BrandVoiceTestResponse(**sample)
 
     def upload_logo(self, workspace: dict, *, data: bytes, content_type: str, filename: Optional[str] = None) -> str:
@@ -1191,24 +1196,14 @@ class SocialMediaService:
         upload = upload_workspace_logo_bytes(
             workspace["id"], data, content_type=content_type, filename_hint=filename
         )
-        row = self._get_brand_voice_row(workspace["id"])
-        if not row:
-            self.db["social_brand_voices"].insert_one(
-                {"id": new_id(), "workspace_id": workspace["id"], "logo_url": upload.url, "updated_at": utcnow()}
-            )
-        else:
-            self.db["social_brand_voices"].update_one(
-                {"workspace_id": workspace["id"]}, {"$set": {"logo_url": upload.url, "updated_at": utcnow()}}
-            )
+        self.db["social_brand_voices"].update_one(
+            {"workspace_id": workspace["id"]},
+            {"$set": {"logo_url": upload.url, "updated_at": utcnow()}, "$setOnInsert": {"id": new_id()}},
+            upsert=True,
+        )
         return upload.url
 
     def generate_post(self, workspace: dict, payload: GeneratePostRequest, user: Optional[dict] = None) -> GeneratePostResponse:
-        from app.social.ai.generator import (
-            generate_carousel_content,
-            generate_platform_content,
-            generate_poll_content,
-            generate_thread_content,
-        )
         from app.social.limits import enforce_ai_text_limit
         from app.plans.service import record_ai_usage
 
@@ -1216,8 +1211,19 @@ class SocialMediaService:
 
         brand_voice = self._brand_voice_dict(workspace["id"])
         fmt = (payload.format or "single").lower()
-
+        response = self._generate_post_content(payload, fmt, brand_voice)
         record_ai_usage(self.db, workspace["id"], "text", user_id=user["id"] if user else None)
+        return response
+
+    def _generate_post_content(
+        self, payload: GeneratePostRequest, fmt: str, brand_voice: dict
+    ) -> GeneratePostResponse:
+        from app.social.ai.generator import (
+            generate_carousel_content,
+            generate_platform_content,
+            generate_poll_content,
+            generate_thread_content,
+        )
 
         if fmt == "carousel":
             result = generate_carousel_content(
@@ -1345,8 +1351,8 @@ class SocialMediaService:
             query["media_type"] = params.mediaType
         if params.source in ("uploaded", "ai_generated"):
             query["source"] = params.source
-        if params.search:
-            query["prompt"] = {"$regex": params.search.strip(), "$options": "i"}
+        if params.search and params.search.strip():
+            query["prompt"] = {"$regex": re.escape(params.search.strip()), "$options": "i"}
 
         total = self.db["social_media_assets"].count_documents(query)
         page_size = params.pageSize
@@ -1361,12 +1367,32 @@ class SocialMediaService:
             .limit(page_size)
         )
 
+        stats = MediaAssetStats()
+        for row in self.db["social_media_assets"].aggregate(
+            [
+                {"$match": {"workspace_id": workspace["id"], "is_deleted": False}},
+                {
+                    "$group": {
+                        "_id": "$media_type",
+                        "count": {"$sum": 1},
+                        "bytes": {"$sum": "$file_size_bytes"},
+                    }
+                },
+            ]
+        ):
+            if row["_id"] == "image":
+                stats.images = int(row["count"])
+            elif row["_id"] == "video":
+                stats.videos = int(row["count"])
+            stats.totalBytes += int(row.get("bytes") or 0)
+
         return MediaAssetListResponse(
             items=[self._serialize_media_asset(row) for row in rows],
             total=total,
             page=page,
             pageSize=page_size,
             totalPages=total_pages,
+            stats=stats,
         )
 
     def get_media_asset(self, workspace: dict, asset_id: str) -> MediaAssetOut:
@@ -1378,14 +1404,12 @@ class SocialMediaService:
         return self._serialize_media_asset(asset)
 
     def delete_media_asset(self, workspace: dict, asset_id: str) -> None:
-        asset = self.db["social_media_assets"].find_one(
-            {"id": str(asset_id), "workspace_id": workspace["id"], "is_deleted": False}
+        result = self.db["social_media_assets"].update_one(
+            {"id": str(asset_id), "workspace_id": workspace["id"], "is_deleted": False},
+            {"$set": {"is_deleted": True, "updated_at": utcnow()}},
         )
-        if not asset:
+        if not result.matched_count:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media asset not found")
-        self.db["social_media_assets"].update_one(
-            {"id": str(asset_id)}, {"$set": {"is_deleted": True, "updated_at": utcnow()}}
-        )
 
     def generate_image(
         self,
@@ -1408,7 +1432,6 @@ class SocialMediaService:
         from app.plans.service import record_ai_usage
 
         enforce_ai_image_limit(self.db, workspace)
-        record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"] if user else None)
 
         if not style:
             org_settings = self.db["social_settings"].find_one({"workspace_id": workspace["id"]})
@@ -1452,6 +1475,7 @@ class SocialMediaService:
             file_size_bytes=upload.file_size,
             prompt=topic,
         )
+        record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"] if user else None)
 
         return GenerateImageResponse(
             imageUrl=upload.url, source=str(data["source"]), assetId=str(asset["id"])
@@ -1496,7 +1520,6 @@ class SocialMediaService:
         from app.plans.service import record_ai_usage
 
         enforce_ai_video_limit(self.db, workspace)
-        record_ai_usage(self.db, workspace["id"], "video", user_id=user["id"] if user else None)
 
         if mode == "remix":
             if not remix_video_id:
@@ -1528,6 +1551,7 @@ class SocialMediaService:
             sora_video_id=result.get("soraVideoId"),
             duration_seconds=duration if mode != "remix" else None,
         )
+        record_ai_usage(self.db, workspace["id"], "video", user_id=user["id"] if user else None)
         return GenerateVideoResponse(
             videoUrl=upload.url,
             source=result["source"],
@@ -1717,6 +1741,9 @@ class SocialMediaService:
             self._clear_default(str(workspace_id), platform)
             self.db["social_accounts"].update_one({"id": account["id"]}, {"$set": {"is_default": True}})
             account = self.db["social_accounts"].find_one({"id": account["id"]})
+        from app.social.dashboard_cache import invalidate_dashboard
+
+        invalidate_dashboard(str(workspace_id))
         return account
 
     def _apply_profile(self, account: dict, profile: OAuthAccountProfile, *, reactivate: bool) -> dict:
@@ -1814,10 +1841,11 @@ class SocialMediaService:
             updatedAt=_iso(account.get("updated_at")) or "",
         )
 
-    def _serialize_post(self, post: dict) -> SocialPostOut:
+    def _serialize_post(self, post: dict, platforms: Optional[list[dict]] = None) -> SocialPostOut:
         from app.social.media import resolve_stored_image_url
 
-        platforms = _get_post_platforms(self.db, post["id"])
+        if platforms is None:
+            platforms = _get_post_platforms(self.db, post["id"])
         platform_outs = [
             SocialPostPlatformOut(
                 id=str(pp["id"]),

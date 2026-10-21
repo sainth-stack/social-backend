@@ -5,7 +5,7 @@ from urllib.parse import quote
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from pymongo.database import Database
 
@@ -16,6 +16,7 @@ from app.auth.google import (
     google_oauth_configured,
 )
 from app.auth.schemas import (
+    AuthSessionResponse,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
     LoginRequest,
@@ -24,13 +25,13 @@ from app.auth.schemas import (
     RegisterResponse,
     ResetPasswordRequest,
     ResetPasswordResponse,
-    TokenResponse,
     UserOut,
     WorkspaceSummaryOut,
 )
 from app.auth.service import (
     authenticate_user,
     issue_token_for_user,
+    list_workspace_summaries,
     register_user,
     request_password_reset,
     reset_password,
@@ -45,18 +46,25 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _session_payload(db: Database, user: dict) -> dict:
+    return {
+        "access_token": issue_token_for_user(user),
+        "user": UserOut.model_validate(public_doc(user)),
+        "workspaces": list_workspace_summaries(db, str(user["id"])),
+    }
+
+
 @router.post("/register", response_model=RegisterResponse, status_code=201)
 def register(
     payload: RegisterRequest,
     request: Request,
+    background: BackgroundTasks,
     db: Database = Depends(get_db),
 ) -> RegisterResponse:
     enforce_rate_limit(request, key_prefix="auth_register", limit=10, window_seconds=3600)
-    user, workspace, membership = register_user(db, payload)
-    token = issue_token_for_user(user)
+    user, workspace, membership = register_user(db, payload, background)
     return RegisterResponse(
-        access_token=token,
-        user=UserOut.model_validate(public_doc(user)),
+        **_session_payload(db, user),
         workspace=WorkspaceSummaryOut(
             id=workspace["id"],
             name=workspace["name"],
@@ -67,12 +75,12 @@ def register(
     )
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=AuthSessionResponse)
 def login(
     payload: LoginRequest,
     request: Request,
     db: Database = Depends(get_db),
-) -> TokenResponse:
+) -> AuthSessionResponse:
     enforce_rate_limit(request, key_prefix="auth_login", limit=30, window_seconds=900)
     try:
         user = authenticate_user(db, payload)
@@ -83,18 +91,18 @@ def login(
             payload.email.lower().strip(),
         )
         raise
-    token = issue_token_for_user(user)
-    return TokenResponse(access_token=token)
+    return AuthSessionResponse(**_session_payload(db, user))
 
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)
 def forgot_password(
     payload: ForgotPasswordRequest,
     request: Request,
+    background: BackgroundTasks,
     db: Database = Depends(get_db),
 ) -> ForgotPasswordResponse:
     enforce_rate_limit(request, key_prefix="auth_forgot", limit=10, window_seconds=3600)
-    request_password_reset(db, payload.email)
+    request_password_reset(db, payload.email, background)
     return ForgotPasswordResponse()
 
 
@@ -145,21 +153,7 @@ def google_auth_callback(
 
 @router.get("/me", response_model=MeResponse)
 def me(current_user: dict = Depends(get_current_user), db: Database = Depends(get_db)) -> MeResponse:
-    memberships = list(db["workspace_members"].find({"user_id": current_user["id"]}))
-    workspace_ids = [m["workspace_id"] for m in memberships]
-    workspaces_map = {
-        w["id"]: w
-        for w in db["workspaces"].find({"id": {"$in": workspace_ids}})
-    }
-    workspace_summaries = [
-        WorkspaceSummaryOut(
-            id=m["workspace_id"],
-            name=workspaces_map.get(m["workspace_id"], {}).get("name", ""),
-            plan=workspaces_map.get(m["workspace_id"], {}).get("plan", "starter"),
-            role=m["role"],
-            social_level=m["social_level"],
-        )
-        for m in memberships
-        if m["workspace_id"] in workspaces_map
-    ]
-    return MeResponse(user=UserOut.model_validate(public_doc(current_user)), workspaces=workspace_summaries)
+    return MeResponse(
+        user=UserOut.model_validate(public_doc(current_user)),
+        workspaces=list_workspace_summaries(db, current_user["id"]),
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import redis
 
@@ -81,13 +82,18 @@ class _NullRedis:
 
 
 _cached_client: "redis.Redis | None" = None
+_unavailable_until = 0.0
+_RETRY_AFTER_SECONDS = 30.0
+_NULL_REDIS = _NullRedis()
 
 
 def get_redis_client() -> redis.Redis:
     """Shared Redis client. Falls back to a no-op stub if unreachable."""
-    global _cached_client
+    global _cached_client, _unavailable_until
     if _cached_client is not None and not isinstance(_cached_client, _NullRedis):
         return _cached_client
+    if time.monotonic() < _unavailable_until:
+        return _NULL_REDIS  # type: ignore[return-value]
     try:
         client = redis.from_url(
             settings.redis_url,
@@ -99,11 +105,13 @@ def get_redis_client() -> redis.Redis:
         _cached_client = client
         return client  # type: ignore[return-value]
     except Exception as exc:
+        _unavailable_until = time.monotonic() + _RETRY_AFTER_SECONDS
         logger.warning(
-            "Redis unavailable (%s) — using in-process no-op stub.",
+            "Redis unavailable (%s) — using in-process no-op stub for %.0fs.",
             exc,
+            _RETRY_AFTER_SECONDS,
         )
-        return _NullRedis()  # type: ignore[return-value]
+        return _NULL_REDIS  # type: ignore[return-value]
 
 
 def ping_redis() -> bool:

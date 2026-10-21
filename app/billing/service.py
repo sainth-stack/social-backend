@@ -12,6 +12,7 @@ from app.billing.pricing import assert_upgrade_allowed, monthly_price_paise, PAI
 from app.billing.razorpay import RazorpayAdapter
 from app.core.mongo_utils import new_id, utcnow
 from app.plans.catalog import get_plan_definition
+from app.social.dashboard_cache import invalidate_dashboard
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,7 @@ def _fulfill_payment(
             }
         },
     )
+    invalidate_dashboard(str(workspace_id))
 
     coupon_id = payment.get("coupon_id")
     if coupon_id:

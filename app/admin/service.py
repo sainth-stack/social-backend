@@ -22,6 +22,7 @@ from app.core.mongo_utils import new_id, utcnow
 from app.core.security import hash_password
 from app.plans import service as plans_service
 from app.plans.catalog import PLAN_CATALOG, PLAN_ORDER
+from app.social.dashboard_cache import invalidate_dashboard
 from app.social.models import SocialPlatformPostStatus, SocialPostStatus
 from app.workspaces.models import SocialLevel, WorkspacePlan, WorkspaceRole
 
@@ -126,6 +127,7 @@ def set_workspace_plan(db: Database, workspace_id: str, plan: str) -> dict:
     db["workspaces"].update_one(
         {"id": str(workspace_id)}, {"$set": {"plan": plan_val, "updated_at": utcnow()}}
     )
+    invalidate_dashboard(str(workspace_id))
     return db["workspaces"].find_one({"id": str(workspace_id)})
 
 
@@ -495,6 +497,7 @@ def set_admin_user_plan(db: Database, user_id: str, plan: str) -> AdminUserListI
     db["workspaces"].update_one(
         {"id": workspace["id"]}, {"$set": {"plan": plan_val, "updated_at": utcnow()}}
     )
+    invalidate_dashboard(str(workspace["id"]))
     return _admin_user_item_for(db, user)
 
 

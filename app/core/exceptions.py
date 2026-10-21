@@ -37,15 +37,12 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(NetworkTimeout)
     @app.exception_handler(ServerSelectionTimeoutError)
     async def mongo_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-        from app.core.database import reset_mongo_client
-
         logger.warning(
             "MongoDB unavailable on %s %s: %s",
             request.method,
             request.url.path,
             exc,
         )
-        reset_mongo_client()
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"detail": "Database temporarily unavailable. Please retry."},

@@ -7,11 +7,18 @@ from collections.abc import Callable, Generator
 from typing import Any, TypeVar
 
 import certifi
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient
 from pymongo.database import Database
-from pymongo.errors import AutoReconnect, ConnectionFailure, NetworkTimeout, ServerSelectionTimeoutError
+from pymongo.errors import (
+    AutoReconnect,
+    ConnectionFailure,
+    NetworkTimeout,
+    OperationFailure,
+    ServerSelectionTimeoutError,
+)
 
 from app.core.config import settings
+from app.core.db_metrics import CommandMetricsListener
 
 logger = logging.getLogger(__name__)
 
@@ -36,20 +43,10 @@ def _mongo_client_kwargs() -> dict[str, Any]:
         "retryReads": True,
         "retryWrites": True,
         "maxPoolSize": 50,
+        "minPoolSize": 2,
         "tlsCAFile": certifi.where(),
+        "event_listeners": [CommandMetricsListener()],
     }
-
-
-def reset_mongo_client() -> None:
-    """Drop the shared client so the next request opens fresh TLS connections."""
-    global _client
-    with _client_lock:
-        if _client is not None:
-            try:
-                _client.close()
-            except Exception as exc:  # noqa: BLE001 — best-effort close
-                logger.debug("MongoClient close: %s", exc)
-            _client = None
 
 
 def _get_client() -> MongoClient:
@@ -78,8 +75,7 @@ def mongo_retry_once(
     try:
         return func(*args, **kwargs)
     except _MONGO_TRANSIENT as exc:
-        logger.warning("MongoDB transient error (%s); resetting client and retrying once", exc)
-        reset_mongo_client()
+        logger.warning("MongoDB transient error (%s); retrying once", exc)
         if refresh is not None:
             refresh()
         time.sleep(0.25)
@@ -94,45 +90,103 @@ def init_db() -> None:
     _ensure_indexes(get_database())
 
 
+_ID_COLLECTIONS = (
+    "users",
+    "workspaces",
+    "workspace_members",
+    "social_accounts",
+    "social_posts",
+    "social_post_platforms",
+    "social_audit_logs",
+    "social_templates",
+    "social_media_assets",
+)
+
+
+def _index_specs() -> dict[str, list[IndexModel]]:
+    def idx(*keys: tuple[str, int], **kwargs: Any) -> IndexModel:
+        return IndexModel(list(keys), **kwargs)
+
+    return {
+        "users": [
+            idx(("email", ASCENDING), unique=True),
+            idx(("google_id", ASCENDING), sparse=True),
+        ],
+        "workspaces": [idx(("owner_user_id", ASCENDING))],
+        "workspace_members": [
+            idx(("user_id", ASCENDING), ("workspace_id", ASCENDING), unique=True),
+            idx(("workspace_id", ASCENDING)),
+        ],
+        "social_accounts": [
+            idx(
+                ("workspace_id", ASCENDING),
+                ("platform", ASCENDING),
+                ("platform_account_id", ASCENDING),
+                unique=True,
+            ),
+            idx(("workspace_id", ASCENDING), ("is_active", ASCENDING)),
+        ],
+        "social_posts": [
+            idx(("workspace_id", ASCENDING), ("status", ASCENDING)),
+            idx(("workspace_id", ASCENDING), ("scheduled_at", ASCENDING)),
+            idx(("workspace_id", ASCENDING), ("status", ASCENDING), ("scheduled_at", ASCENDING)),
+            idx(("workspace_id", ASCENDING), ("created_at", DESCENDING)),
+            idx(("workspace_id", ASCENDING), ("updated_at", DESCENDING)),
+        ],
+        "social_post_platforms": [idx(("post_id", ASCENDING))],
+        "social_media_assets": [idx(("workspace_id", ASCENDING), ("created_at", DESCENDING))],
+        "social_analytics_daily": [
+            idx(
+                ("workspace_id", ASCENDING),
+                ("social_account_id", ASCENDING),
+                ("date", ASCENDING),
+                unique=True,
+            ),
+            idx(("workspace_id", ASCENDING), ("date", ASCENDING)),
+        ],
+        "social_audit_logs": [idx(("workspace_id", ASCENDING), ("created_at", DESCENDING))],
+        "social_settings": [idx(("workspace_id", ASCENDING), unique=True)],
+        "social_brand_voices": [idx(("workspace_id", ASCENDING), unique=True)],
+        "social_templates": [
+            idx(("workspace_id", ASCENDING)),
+            idx(("workspace_id", ASCENDING), ("is_system", ASCENDING)),
+        ],
+        "plans_ai_usage": [
+            idx(("workspace_id", ASCENDING), ("created_at", DESCENDING)),
+            idx(("workspace_id", ASCENDING), ("kind", ASCENDING), ("created_at", DESCENDING)),
+        ],
+        "plan_overrides": [idx(("plan_key", ASCENDING), unique=True)],
+        "billing_payments": [
+            idx(("workspace_id", ASCENDING), ("created_at", DESCENDING)),
+            idx(("provider_order_id", ASCENDING), sparse=True),
+            idx(("id", ASCENDING), unique=True),
+        ],
+        "billing_coupons": [idx(("code", ASCENDING), unique=True)],
+        "billing_coupon_redemptions": [
+            idx(("coupon_id", ASCENDING), ("created_at", DESCENDING)),
+            idx(("workspace_id", ASCENDING), ("created_at", DESCENDING)),
+        ],
+    }
+
+
+def _ensure_id_index(db: Database, collection: str) -> None:
+    try:
+        db[collection].create_index([("id", ASCENDING)], unique=True)
+    except OperationFailure as exc:
+        # Legacy duplicates/missing ids must not leave the hot `id` lookups unindexed.
+        logger.warning("Unique id index failed on %s (%s); creating non-unique", collection, exc)
+        db[collection].create_index([("id", ASCENDING)], name="id_1_nonunique")
+
+
 def _ensure_indexes(db: Database) -> None:
-    db["users"].create_index([("email", ASCENDING)], unique=True)
-    db["users"].create_index([("google_id", ASCENDING)], sparse=True)
-    db["workspaces"].create_index([("owner_user_id", ASCENDING)])
-    db["workspace_members"].create_index(
-        [("user_id", ASCENDING), ("workspace_id", ASCENDING)], unique=True
-    )
-    db["social_accounts"].create_index(
-        [("workspace_id", ASCENDING), ("platform", ASCENDING), ("platform_account_id", ASCENDING)],
-        unique=True,
-    )
-    db["social_posts"].create_index([("workspace_id", ASCENDING), ("status", ASCENDING)])
-    db["social_posts"].create_index([("workspace_id", ASCENDING), ("scheduled_at", ASCENDING)])
-    db["social_post_platforms"].create_index([("post_id", ASCENDING)])
-    db["social_media_assets"].create_index(
-        [("workspace_id", ASCENDING), ("created_at", DESCENDING)]
-    )
-    db["social_analytics_daily"].create_index(
-        [("workspace_id", ASCENDING), ("social_account_id", ASCENDING), ("date", ASCENDING)],
-        unique=True,
-    )
-    db["social_audit_logs"].create_index(
-        [("workspace_id", ASCENDING), ("created_at", DESCENDING)]
-    )
-    db["social_settings"].create_index([("workspace_id", ASCENDING)], unique=True)
-    db["social_brand_voices"].create_index([("workspace_id", ASCENDING)], unique=True)
-    db["social_templates"].create_index([("workspace_id", ASCENDING)])
-    db["plans_ai_usage"].create_index(
-        [("workspace_id", ASCENDING), ("created_at", DESCENDING)]
-    )
-    db["plan_overrides"].create_index([("plan_key", ASCENDING)], unique=True)
-    db["billing_payments"].create_index([("workspace_id", ASCENDING), ("created_at", DESCENDING)])
-    db["billing_payments"].create_index([("provider_order_id", ASCENDING)], sparse=True)
-    db["billing_payments"].create_index([("id", ASCENDING)], unique=True)
-    db["billing_coupons"].create_index([("code", ASCENDING)], unique=True)
-    db["billing_coupon_redemptions"].create_index(
-        [("coupon_id", ASCENDING), ("created_at", DESCENDING)]
-    )
-    db["billing_coupon_redemptions"].create_index(
-        [("workspace_id", ASCENDING), ("created_at", DESCENDING)]
-    )
+    for collection, models in _index_specs().items():
+        try:
+            db[collection].create_indexes(models)
+        except OperationFailure as exc:
+            logger.warning("Index creation failed on %s: %s", collection, exc)
+    for collection in _ID_COLLECTIONS:
+        try:
+            _ensure_id_index(db, collection)
+        except OperationFailure as exc:
+            logger.warning("Id index creation failed on %s: %s", collection, exc)
     print("[db] MongoDB indexes ensured")

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 from typing import BinaryIO
 from urllib.parse import quote
 
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import HTTPException, status
 
@@ -15,6 +17,7 @@ from app.providers.storage.base import ObjectStorageProvider
 logger = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=1)
 def _client():
     try:
         import boto3
@@ -26,6 +29,7 @@ def _client():
         aws_access_key_id=settings.aws_access_key_id,
         aws_secret_access_key=settings.aws_secret_access_key,
         region_name=settings.aws_region,
+        config=Config(max_pool_connections=50),
     )
 
 

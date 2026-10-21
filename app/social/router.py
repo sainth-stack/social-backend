@@ -14,16 +14,19 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Request,
     Response,
     UploadFile,
     status,
 )
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
 from pymongo.database import Database
 
 from app.auth.deps import get_current_user
 from app.core.database import get_db
 from app.workspaces.deps import require_workspace_access
+from app.social.dashboard_cache import invalidate_dashboard
 from app.social.dependencies import get_social_account_or_404, get_social_post_or_404
 from app.social.models import SocialPlatform
 from app.social.schemas import (
@@ -74,9 +77,17 @@ from app.social.service import SocialMediaService
 
 logger = logging.getLogger(__name__)
 
+
+def _invalidate_dashboard_after_write(workspace_id: str, request: Request):
+    yield
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        invalidate_dashboard(workspace_id)
+
+
 router = APIRouter(
     prefix="/workspaces/{workspace_id}/social",
     tags=["social-media"],
+    dependencies=[Depends(_invalidate_dashboard_after_write)],
 )
 
 # Public OAuth browser callback (Meta redirects here)
@@ -659,7 +670,8 @@ async def upload_logo(
 ) -> UploadLogoResponse:
     """Upload workspace logo to S3; persists on brand voice profile."""
     data = await file.read()
-    logo_url = SocialMediaService(db).upload_logo(
+    logo_url = await run_in_threadpool(
+        SocialMediaService(db).upload_logo,
         workspace,
         data=data,
         content_type=file.content_type or "image/png",
@@ -677,7 +689,8 @@ async def upload_image(
 ) -> GenerateImageResponse:
     """Upload a social post image to object storage; returns a public HTTPS URL."""
     data = await file.read()
-    return SocialMediaService(db).upload_image(
+    return await run_in_threadpool(
+        SocialMediaService(db).upload_image,
         workspace,
         user,
         data=data,
@@ -727,11 +740,11 @@ async def generate_video(
         ref_bytes = await reference_image.read()
         ref_mime = reference_image.content_type or "image/jpeg"
     elif reference_image_url and reference_image_url.strip():
-        try:
-            import httpx as _httpx
+        import httpx as _httpx
 
-            with _httpx.Client(timeout=60.0, follow_redirects=True) as client:
-                resp = client.get(reference_image_url.strip())
+        try:
+            async with _httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                resp = await client.get(reference_image_url.strip())
                 resp.raise_for_status()
                 ref_bytes = resp.content
                 ref_mime = resp.headers.get("content-type") or "image/jpeg"
@@ -742,7 +755,8 @@ async def generate_video(
             ) from exc
 
     try:
-        return SocialMediaService(db).generate_video(
+        return await run_in_threadpool(
+            SocialMediaService(db).generate_video,
             workspace,
             user,
             prompt=prompt,
@@ -775,7 +789,8 @@ async def upload_video(
             detail="Only video files are accepted by this endpoint",
         )
     data = await file.read()
-    return SocialMediaService(db).upload_video(
+    return await run_in_threadpool(
+        SocialMediaService(db).upload_video,
         workspace,
         user,
         data=data,
@@ -959,6 +974,16 @@ def dashboard_stats(
     from app.social.polish import SocialPolishService
 
     return SocialPolishService(db).dashboard_stats(workspace)
+
+
+@router.get("/usage")
+def usage(
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+) -> dict:
+    from app.social.polish import SocialPolishService
+
+    return SocialPolishService(db).usage(workspace)
 
 
 @router.get("/activity")

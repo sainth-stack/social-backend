@@ -330,12 +330,19 @@ class MediaAssetOut(BaseModel):
     createdAt: str
 
 
+class MediaAssetStats(BaseModel):
+    images: int = 0
+    videos: int = 0
+    totalBytes: int = 0
+
+
 class MediaAssetListResponse(BaseModel):
     items: List[MediaAssetOut]
     total: int
     page: int
     pageSize: int
     totalPages: int
+    stats: MediaAssetStats = Field(default_factory=MediaAssetStats)
 
 
 class ApplyTemplateRequest(BaseModel):

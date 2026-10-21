@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -29,6 +30,8 @@ from app.social.template_utils import (
 )
 from app.social.permissions import can_manage_team, get_user_permission, require_permission
 from app.workspaces.models import SocialLevel
+
+_DASHBOARD_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="dashboard")
 
 DEFAULT_NOTIFICATION_EVENTS = {
     "post_published": True,
@@ -477,68 +480,90 @@ class SocialPolishService:
     def dashboard_home(self, workspace: dict) -> dict:
         """Single payload for the workspace home dashboard (one round-trip)."""
         from app.core.database import get_database, mongo_retry_once
+        from app.social.dashboard_cache import cached_dashboard
 
         def _refresh_db() -> None:
             self.db = get_database()
 
-        return mongo_retry_once(
-            self._dashboard_home_impl,
-            workspace,
-            refresh=_refresh_db,
+        return cached_dashboard(
+            str(workspace["id"]),
+            "home",
+            lambda: mongo_retry_once(self._dashboard_home_impl, workspace, refresh=_refresh_db),
         )
 
     def _dashboard_home_impl(self, workspace: dict) -> dict:
+        import contextvars
+
         from app.social.schemas import SocialPostListParams, SocialPostStatus
         from app.social.service import SocialMediaService
 
-        stats = self._dashboard_stats_impl(workspace)
-        activity = self._activity_impl(workspace, 10)
-        recommendations = self.recommendations(workspace)
-        posts_page = SocialMediaService(self.db).list_posts(
-            workspace,
-            SocialPostListParams(
-                status=SocialPostStatus.SCHEDULED,
-                page=1,
-                pageSize=4,
-            ),
-        )
-        return {
-            "stats": stats,
-            "activity": activity,
-            "recommendations": recommendations,
-            "scheduledPosts": posts_page.items,
+        def _scheduled() -> list[dict]:
+            page = SocialMediaService(self.db).list_posts(
+                workspace,
+                SocialPostListParams(status=SocialPostStatus.SCHEDULED, page=1, pageSize=4),
+            )
+            return [p.model_dump(mode="json", by_alias=True) for p in page.items]
+
+        sections = {
+            "stats": lambda: self._dashboard_stats_impl(workspace),
+            "activity": lambda: self._activity_impl(workspace, 10),
+            "recommendations": lambda: self.recommendations(workspace),
+            "scheduledPosts": _scheduled,
         }
+        # Sections are independent; overlapping their Mongo round-trips cuts latency to the slowest one.
+        futures = {
+            name: _DASHBOARD_POOL.submit(contextvars.copy_context().run, fn)
+            for name, fn in sections.items()
+        }
+        return {name: future.result() for name, future in futures.items()}
 
     def dashboard_stats(self, workspace: dict) -> dict:
         from app.core.database import get_database, mongo_retry_once
+        from app.social.dashboard_cache import cached_dashboard
 
         def _refresh_db() -> None:
             self.db = get_database()
 
-        return mongo_retry_once(
-            self._dashboard_stats_impl,
-            workspace,
-            refresh=_refresh_db,
+        return cached_dashboard(
+            str(workspace["id"]),
+            "stats",
+            lambda: mongo_retry_once(self._dashboard_stats_impl, workspace, refresh=_refresh_db),
+        )
+
+    def usage(self, workspace: dict) -> dict:
+        from app.social.dashboard_cache import cached_dashboard
+
+        return cached_dashboard(
+            str(workspace["id"]), "usage", lambda: usage_snapshot(self.db, workspace)
         )
 
     def _dashboard_stats_impl(self, workspace: dict) -> dict:
         accounts = list(
             self.db["social_accounts"].find(
-                {"workspace_id": workspace["id"], "is_active": True}
+                {"workspace_id": workspace["id"], "is_active": True},
+                {
+                    "_id": 0,
+                    "id": 1,
+                    "platform": 1,
+                    "account_name": 1,
+                    "follower_count": 1,
+                    "token_expires_at": 1,
+                    "is_default": 1,
+                    "is_active": 1,
+                    "access_token_enc": 1,
+                },
             )
         )
-        week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        now = datetime.now(timezone.utc)
         posts_week = self.db["social_posts"].count_documents(
-            {"workspace_id": workspace["id"], "created_at": {"$gte": week_ago}}
+            {"workspace_id": workspace["id"], "created_at": {"$gte": now - timedelta(days=7)}}
         )
         from app.social.analytics.aggregator import AnalyticsAggregator
 
-        overview = AnalyticsAggregator(self.db).overview(
-            workspace["id"],
-            (datetime.now(timezone.utc) - timedelta(days=29)).date().isoformat(),
-            datetime.now(timezone.utc).date().isoformat(),
+        metrics = AnalyticsAggregator(self.db).summary_metrics(
+            workspace["id"], (now - timedelta(days=29)).date(), now.date()
         )
-        metrics = overview["metrics"]
+        statuses = [self._token_status(a) for a in accounts]
         expired = sum(
             1
             for a in accounts
@@ -548,25 +573,25 @@ class SocialPolishService:
                 if a["token_expires_at"].tzinfo is None
                 else a["token_expires_at"]
             )
-            <= datetime.now(timezone.utc)
+            <= now
         )
         return {
             "connectedAccounts": len(accounts),
             "expiredAccounts": expired,
             "postsThisWeek": posts_week,
-            "totalReach": metrics.get("totalReach", 0),
-            "avgEngagementRate": metrics.get("avgEngagementRate", 0),
-            "usage": usage_snapshot(self.db, workspace),
+            "totalReach": metrics["totalReach"],
+            "avgEngagementRate": metrics["avgEngagementRate"],
+            "usage": usage_snapshot(self.db, workspace, active_accounts=len(accounts)),
             "accounts": [
                 {
                     "id": str(a["id"]),
                     "platform": a.get("platform"),
                     "accountName": a.get("account_name"),
                     "followerCount": a.get("follower_count"),
-                    "tokenStatus": self._token_status(a),
+                    "tokenStatus": token_status,
                     "isDefault": a.get("is_default"),
                 }
-                for a in accounts
+                for a, token_status in zip(accounts, statuses)
             ],
         }
 
@@ -599,7 +624,9 @@ class SocialPolishService:
             ]
             title_by_post_id: dict[str, str] = {}
             if post_ids:
-                for post in self.db["social_posts"].find({"id": {"$in": post_ids}}):
+                for post in self.db["social_posts"].find(
+                    {"id": {"$in": post_ids}}, {"_id": 0, "id": 1, "title": 1}
+                ):
                     title_by_post_id[post["id"]] = post.get("title", "")
 
             items = [
@@ -648,7 +675,9 @@ class SocialPolishService:
         )
         platforms_by_post: dict[str, list[str]] = {}
         if post_ids:
-            for pp in self.db["social_post_platforms"].find({"post_id": {"$in": post_ids}}):
+            for pp in self.db["social_post_platforms"].find(
+                {"post_id": {"$in": post_ids}}, {"_id": 0, "post_id": 1, "platform": 1}
+            ):
                 pid = str(pp.get("post_id") or "")
                 platform = (pp.get("platform") or "").strip()
                 if not pid or not platform:
@@ -811,7 +840,7 @@ class SocialPolishService:
 
     def recommendations(self, workspace: dict) -> list[dict]:
         voice = self.db["social_brand_voices"].find_one(
-            {"workspace_id": workspace["id"]}
+            {"workspace_id": workspace["id"]}, {"_id": 0, "brand_name": 1, "industry": 1}
         )
         brand = voice.get("brand_name") if voice else workspace.get("name", "your brand")
         industry = voice.get("industry") if voice else "your industry"

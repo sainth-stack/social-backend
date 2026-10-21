@@ -25,7 +25,7 @@ def get_current_user(
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    user = db["users"].find_one({"id": str(user_id)})
+    user = db["users"].find_one({"id": str(user_id)}, {"password_hash": 0})
     if not user or not user.get("is_active"):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     return user

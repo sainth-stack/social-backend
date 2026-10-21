@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import secrets
 
-from fastapi import HTTPException, status
+from fastapi import BackgroundTasks, HTTPException, status
 from pymongo.database import Database
 
 from app.auth.schemas import LoginRequest, RegisterRequest
@@ -24,7 +24,16 @@ def get_user_by_email(db: Database, email: str) -> dict | None:
     return db["users"].find_one({"email": email.lower().strip()})
 
 
-def register_user(db: Database, payload: RegisterRequest) -> tuple[dict, dict, dict]:
+def _send_welcome_email(email: str, full_name: str | None, workspace_name: str) -> None:
+    try:
+        email_service.send_welcome(to=email, full_name=full_name, workspace_name=workspace_name)
+    except Exception:
+        logger.exception("Welcome email failed for %s", email)
+
+
+def register_user(
+    db: Database, payload: RegisterRequest, background: BackgroundTasks
+) -> tuple[dict, dict, dict]:
     email = payload.email.lower().strip()
     if get_user_by_email(db, email):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
@@ -57,8 +66,6 @@ def register_user(db: Database, payload: RegisterRequest) -> tuple[dict, dict, d
         "created_at": now,
         "updated_at": now,
     }
-    db["workspaces"].insert_one(workspace)
-
     mem_id = new_id()
     membership = {
         "id": mem_id,
@@ -68,17 +75,16 @@ def register_user(db: Database, payload: RegisterRequest) -> tuple[dict, dict, d
         "social_level": SocialLevel.ADMIN.value,
         "created_at": now,
     }
-    db["workspace_members"].insert_one(membership)
-
     try:
-        email_service.send_welcome(
-            to=user["email"],
-            full_name=user.get("full_name"),
-            workspace_name=workspace["name"],
-        )
+        db["workspaces"].insert_one(workspace)
+        db["workspace_members"].insert_one(membership)
     except Exception:
-        logger.exception("Welcome email failed for %s", user["email"])
+        db["workspace_members"].delete_one({"id": mem_id})
+        db["workspaces"].delete_one({"id": ws_id})
+        db["users"].delete_one({"id": user_id})
+        raise
 
+    background.add_task(_send_welcome_email, user["email"], user.get("full_name"), workspace["name"])
     return user, workspace, membership
 
 
@@ -114,7 +120,45 @@ def issue_token_for_user(user: dict) -> str:
     )
 
 
-def request_password_reset(db: Database, email: str) -> None:
+def list_workspace_summaries(db: Database, user_id: str) -> list[dict]:
+    memberships = list(
+        db["workspace_members"].find(
+            {"user_id": user_id}, {"_id": 0, "workspace_id": 1, "role": 1, "social_level": 1}
+        )
+    )
+    if not memberships:
+        return []
+    workspaces_map = {
+        w["id"]: w
+        for w in db["workspaces"].find(
+            {"id": {"$in": [m["workspace_id"] for m in memberships]}},
+            {"_id": 0, "id": 1, "name": 1, "plan": 1},
+        )
+    }
+    return [
+        {
+            "id": m["workspace_id"],
+            "name": workspaces_map[m["workspace_id"]].get("name", ""),
+            "plan": workspaces_map[m["workspace_id"]].get("plan", "starter"),
+            "role": m["role"],
+            "social_level": m["social_level"],
+        }
+        for m in memberships
+        if m["workspace_id"] in workspaces_map
+    ]
+
+
+def _send_password_reset_email(email: str, full_name: str | None, reset_url: str) -> None:
+    try:
+        sent = email_service.send_password_reset(to=email, full_name=full_name, reset_url=reset_url)
+    except Exception:
+        logger.exception("Password reset email failed for %s", email)
+        return
+    if not sent:
+        logger.warning("Password reset email not sent for %s (Resend misconfigured or failed)", email)
+
+
+def request_password_reset(db: Database, email: str, background: BackgroundTasks) -> None:
     """Always succeed from the caller's perspective (no email enumeration)."""
     user = get_user_by_email(db, email)
     if not user or not user.get("is_active"):
@@ -125,15 +169,7 @@ def request_password_reset(db: Database, email: str) -> None:
     redis.setex(f"{PASSWORD_RESET_PREFIX}{token}", PASSWORD_RESET_TTL_SECONDS, str(user["id"]))
 
     reset_url = f"{settings.frontend_url.rstrip('/')}/reset-password?token={token}"
-    sent = email_service.send_password_reset(
-        to=user["email"],
-        full_name=user.get("full_name"),
-        reset_url=reset_url,
-    )
-    if not sent:
-        logger.warning(
-            "Password reset email not sent for %s (Resend misconfigured or failed)", user["email"]
-        )
+    background.add_task(_send_password_reset_email, user["email"], user.get("full_name"), reset_url)
 
 
 def reset_password(db: Database, token: str, new_password: str) -> None:

@@ -8,7 +8,11 @@ from fastapi import HTTPException, status
 from pymongo.database import Database
 
 from app.plans.catalog import PlanDefinition, is_unlimited
-from app.plans.service import count_ai_usage_this_month, get_effective_plan
+from app.plans.service import (
+    count_ai_usage_by_kind_this_month,
+    count_ai_usage_this_month,
+    get_effective_plan,
+)
 
 
 def get_limits(db: Database, workspace: dict) -> PlanDefinition:
@@ -129,10 +133,14 @@ def enforce_ai_video_limit(db: Database, workspace: dict) -> None:
     _enforce_ai_limit(db, workspace, "video", plan.limits.ai_videos_per_month, plan.name)
 
 
-def usage_snapshot(db: Database, workspace: dict) -> dict:
+def usage_snapshot(db: Database, workspace: dict, *, active_accounts: int | None = None) -> dict:
     plan = get_limits(db, workspace)
-    accounts = db["social_accounts"].count_documents(
-        {"workspace_id": workspace["id"], "is_active": True}
+    accounts = (
+        active_accounts
+        if active_accounts is not None
+        else db["social_accounts"].count_documents(
+            {"workspace_id": workspace["id"], "is_active": True}
+        )
     )
     posts = db["social_posts"].count_documents(
         {"workspace_id": workspace["id"], "created_at": {"$gte": _month_start()}}
@@ -140,9 +148,10 @@ def usage_snapshot(db: Database, workspace: dict) -> dict:
     templates = db["social_templates"].count_documents(
         {"workspace_id": workspace["id"], "is_system": False}
     )
-    ai_text = count_ai_usage_this_month(db, workspace["id"], "text")
-    ai_images = count_ai_usage_this_month(db, workspace["id"], "image")
-    ai_videos = count_ai_usage_this_month(db, workspace["id"], "video")
+    ai_usage = count_ai_usage_by_kind_this_month(db, workspace["id"])
+    ai_text = ai_usage.get("text", 0)
+    ai_images = ai_usage.get("image", 0)
+    ai_videos = ai_usage.get("video", 0)
     return {
         "plan": workspace.get("plan", "starter"),
         "accounts": {"used": accounts, "limit": plan.limits.connected_accounts},

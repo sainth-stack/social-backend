@@ -602,7 +602,6 @@ class ContentPlanService:
                     break
 
                 try:
-                    record_ai_usage(self.db, workspace["id"], "text", user_id=user["id"])
                     result = generate_platform_content(
                         topic=topic,
                         tone=tone,
@@ -614,6 +613,7 @@ class ContentPlanService:
                         brand_voice=brand,
                         content_series_mode=True,
                     )
+                    record_ai_usage(self.db, workspace["id"], "text", user_id=user["id"])
                 except Exception as exc:
                     logger.warning("Plan %s %s caption failed: %s", day_label, platform_label, exc)
                     errors.append(f"{day_label} ({platform_label}): caption generation failed")
@@ -632,7 +632,6 @@ class ContentPlanService:
                 if need_image:
                     try:
                         enforce_ai_image_limit(self.db, workspace)
-                        record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"])
                         img_data = generate_post_image(
                             topic=build_plan_image_brief(
                                 caption=caption,
@@ -645,6 +644,7 @@ class ContentPlanService:
                             size="1024x1024",
                             mode="create",
                         )
+                        record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"])
                         upload: Optional[SocialBlobUpload] = None
                         if img_data.get("imageB64"):
                             upload = upload_social_image_bytes(

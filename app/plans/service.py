@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 from pymongo.database import Database
@@ -54,13 +55,31 @@ def _coalesce(value, default):
     return value if value is not None else default
 
 
+_OVERRIDE_CACHE_TTL_SECONDS = 60.0
+_override_cache: dict[str, tuple[float, dict | None]] = {}
+
+
+def invalidate_override_cache() -> None:
+    _override_cache.clear()
+
+
 def get_override(db: Database, plan_key: str) -> dict | None:
     return db["plan_overrides"].find_one({"plan_key": plan_key})
 
 
+def _cached_override(db: Database, plan_key: str) -> dict | None:
+    now = time.monotonic()
+    hit = _override_cache.get(plan_key)
+    if hit and hit[0] > now:
+        return hit[1]
+    override = get_override(db, plan_key)
+    _override_cache[plan_key] = (now + _OVERRIDE_CACHE_TTL_SECONDS, override)
+    return override
+
+
 def get_effective_plan(db: Database, plan_key: str) -> PlanDefinition:
     base = get_plan_definition(plan_key)
-    override = get_override(db, plan_key)
+    override = _cached_override(db, plan_key)
     definition, _ = _apply_override(base, override)
     return definition
 
@@ -90,6 +109,7 @@ def upsert_override(db: Database, plan_key: str, data: dict) -> dict:
     from app.core.mongo_utils import new_id, utcnow
 
     now = utcnow()
+    invalidate_override_cache()
     override = get_override(db, plan_key)
     if override is None:
         doc = {"id": new_id(), "plan_key": plan_key, "created_at": now, "updated_at": now}
@@ -123,6 +143,17 @@ def count_ai_usage_this_month(db: Database, workspace_id: str, kind: str) -> int
     ]
     result = list(db["plans_ai_usage"].aggregate(pipeline))
     return int(result[0]["total"]) if result else 0
+
+
+def count_ai_usage_by_kind_this_month(db: Database, workspace_id: str) -> dict[str, int]:
+    pipeline = [
+        {"$match": {"workspace_id": str(workspace_id), "created_at": {"$gte": _month_start()}}},
+        {"$group": {"_id": "$kind", "total": {"$sum": "$quantity"}}},
+    ]
+    return {
+        str(row["_id"]): int(row.get("total") or 0)
+        for row in db["plans_ai_usage"].aggregate(pipeline)
+    }
 
 
 def record_ai_usage(

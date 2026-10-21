@@ -54,10 +54,14 @@ class MeResponse(BaseModel):
     workspaces: list[WorkspaceSummaryOut]
 
 
-class RegisterResponse(BaseModel):
+class AuthSessionResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
+    workspaces: list[WorkspaceSummaryOut]
+
+
+class RegisterResponse(AuthSessionResponse):
     workspace: WorkspaceSummaryOut
 
 

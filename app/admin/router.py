@@ -212,6 +212,7 @@ def update_plan(plan_key: str, payload: PlanUpdateRequest, db: Database = Depend
 @router.delete("/plans/{plan_key}/override", response_model=PlanOut)
 def clear_plan_override(plan_key: str, db: Database = Depends(get_db)) -> PlanOut:
     db["plan_overrides"].delete_one({"plan_key": plan_key})
+    plans_service.invalidate_override_cache()
     return plans_service.to_plan_out(db, plan_key)
 
 

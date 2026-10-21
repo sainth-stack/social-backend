@@ -141,9 +141,16 @@ def get_bedrock_runtime_client(*, region_name: str | None = None) -> Any:
         )
 
     region = (region_name or settings.resolved_bedrock_region).strip()
+    from botocore.config import Config
+
     return boto3.client(
         "bedrock-runtime",
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         region_name=region,
+        config=Config(
+            max_pool_connections=50,
+            read_timeout=120,
+            retries={"mode": "standard", "max_attempts": 2},
+        ),
     )

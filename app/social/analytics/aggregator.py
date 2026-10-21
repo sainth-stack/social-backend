@@ -28,6 +28,77 @@ class AnalyticsAggregator:
     def __init__(self, db: Database) -> None:
         self.db = db
 
+    def _workspace_post_ids(self, workspace_id: str) -> list[str]:
+        return [
+            p["id"]
+            for p in self.db["social_posts"].find(
+                {"workspace_id": str(workspace_id)}, {"_id": 0, "id": 1}
+            )
+        ]
+
+    def summary_metrics(self, workspace_id: str, start: date, end: date) -> dict:
+        """Reach + engagement rate only, computed in Mongo (used by the dashboard)."""
+        totals = list(
+            self.db["social_analytics_daily"].aggregate(
+                [
+                    {
+                        "$match": {
+                            "workspace_id": str(workspace_id),
+                            "date": date_range_filter(start, end),
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": None,
+                            "rows": {"$sum": 1},
+                            "reach": {"$sum": {"$ifNull": ["$total_reach", 0]}},
+                            "impressions": {"$sum": {"$ifNull": ["$total_impressions", 0]}},
+                            "engagements": {"$sum": {"$ifNull": ["$total_engagements", 0]}},
+                        }
+                    },
+                ]
+            )
+        )
+        if not totals or not totals[0].get("rows"):
+            start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+            end_dt = datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + timedelta(days=1)
+            totals = list(
+                self.db["social_post_platforms"].aggregate(
+                    [
+                        {
+                            "$match": {
+                                "post_id": {"$in": self._workspace_post_ids(workspace_id)},
+                                "status": SocialPlatformPostStatus.PUBLISHED.value,
+                                "published_at": {"$gte": start_dt, "$lt": end_dt},
+                            }
+                        },
+                        {
+                            "$group": {
+                                "_id": None,
+                                "reach": {"$sum": {"$ifNull": ["$reach", 0]}},
+                                "impressions": {"$sum": {"$ifNull": ["$impressions", 0]}},
+                                "engagements": {
+                                    "$sum": {
+                                        "$add": [
+                                            {"$ifNull": ["$likes", 0]},
+                                            {"$ifNull": ["$comments", 0]},
+                                            {"$ifNull": ["$shares", 0]},
+                                        ]
+                                    }
+                                },
+                            }
+                        },
+                    ]
+                )
+            )
+        row = totals[0] if totals else {}
+        impressions = int(row.get("impressions") or 0)
+        engagements = int(row.get("engagements") or 0)
+        return {
+            "totalReach": int(row.get("reach") or 0),
+            "avgEngagementRate": round(engagements / impressions, 4) if impressions else 0.0,
+        }
+
     def overview(self, workspace_id: str, from_date: Optional[str], to_date: Optional[str]) -> dict:
         start, end = _parse_range(from_date, to_date)
         rows = self._daily_rows(workspace_id, start, end)
@@ -307,10 +378,7 @@ class AnalyticsAggregator:
         start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
         end_dt = datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + timedelta(days=1)
 
-        post_ids = [
-            p["id"]
-            for p in self.db["social_posts"].find({"workspace_id": str(workspace_id)})
-        ]
+        post_ids = self._workspace_post_ids(workspace_id)
         published = list(
             self.db["social_post_platforms"].find(
                 {
@@ -372,9 +440,7 @@ class AnalyticsAggregator:
 
         start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
         end_dt = datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + timedelta(days=1)
-        post_ids = [
-            p["id"] for p in self.db["social_posts"].find({"workspace_id": str(workspace_id)})
-        ]
+        post_ids = self._workspace_post_ids(workspace_id)
         published = list(
             self.db["social_post_platforms"].find(
                 {
