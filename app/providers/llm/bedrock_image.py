@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -56,12 +57,15 @@ def _parse_size(size: str) -> tuple[int, int]:
     return 1024, 1024
 
 
+_STABILITY_RATIOS = ("1:1", "4:5", "5:4", "2:3", "3:2", "9:16", "16:9", "9:21", "21:9")
+
+
 def _aspect_ratio(width: int, height: int) -> str:
-    if height > width * 1.2:
-        return "9:16"
-    if width > height * 1.2:
-        return "16:9"
-    return "1:1"
+    target = math.log(width / height)
+    return min(
+        _STABILITY_RATIOS,
+        key=lambda r: abs(math.log(int(r.split(":")[0]) / int(r.split(":")[1])) - target),
+    )
 
 
 def _friendly_invoke_error(exc: Exception, *, model: str, region: str) -> RuntimeError:
@@ -119,7 +123,10 @@ def _stability_text_to_image_body(*, prompt: str, width: int, height: int) -> di
         "mode": "text-to-image",
         "aspect_ratio": _aspect_ratio(width, height),
         "output_format": "png",
-        "negative_prompt": "blurry, watermark, text overlay, logo, low quality",
+        "negative_prompt": (
+            "blurry, watermark, text, letters, words, typography, caption, logo, signature, "
+            "low quality, distorted, deformed hands, extra fingers, oversaturated"
+        ),
     }
 
 

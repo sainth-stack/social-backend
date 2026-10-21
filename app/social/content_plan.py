@@ -448,7 +448,7 @@ class ContentPlanService:
     ) -> ContentPlanGenerateResponse:
         from app.plans.service import record_ai_usage
         from app.social.ai.generator import generate_platform_content
-        from app.social.ai.image_generator import generate_post_image
+        from app.social.ai.creative import CreativeSpec
         from app.social.limits import enforce_ai_image_limit, enforce_ai_text_limit, enforce_posts_limit
         from app.social.media import SocialBlobUpload, upload_social_image_bytes
         from app.social.models import SocialPermission
@@ -632,26 +632,24 @@ class ContentPlanService:
                 if need_image:
                     try:
                         enforce_ai_image_limit(self.db, workspace)
-                        img_data = generate_post_image(
-                            topic=build_plan_image_brief(
+                        creative = social.render_brand_creative(
+                            workspace,
+                            build_plan_image_brief(
                                 caption=caption,
                                 brand_name=brand_name,
                                 platform=platform,
                                 day_focus=day_focus,
                                 user_prompt=user_prompt,
                             ),
-                            style=image_style,
-                            size="1024x1024",
-                            mode="create",
+                            image_style,
+                            CreativeSpec(format="post", platform=platform.value, auto_copy=False),
                         )
                         record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"])
-                        upload: Optional[SocialBlobUpload] = None
-                        if img_data.get("imageB64"):
-                            upload = upload_social_image_bytes(
-                                workspace["id"],
-                                img_data["imageB64"],
-                                content_type="image/png",
-                            )
+                        upload: Optional[SocialBlobUpload] = upload_social_image_bytes(
+                            workspace["id"],
+                            creative.image,
+                            content_type="image/jpeg",
+                        )
                         if upload:
                             social._record_media_asset(
                                 workspace,

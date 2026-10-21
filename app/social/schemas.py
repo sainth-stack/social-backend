@@ -208,6 +208,8 @@ class BrandVoiceOut(BaseModel):
     primaryLanguage: str = "en"
     systemPromptOverride: Optional[str] = None
     logoUrl: Optional[str] = None
+    primaryColor: Optional[str] = None
+    accentColor: Optional[str] = None
     updatedAt: Optional[str] = None
 
 
@@ -225,6 +227,8 @@ class BrandVoiceUpdateRequest(BaseModel):
     primaryLanguage: str = Field(default="en", max_length=16)
     systemPromptOverride: Optional[str] = None
     logoUrl: Optional[str] = Field(default=None, max_length=2048)
+    primaryColor: Optional[str] = Field(default=None, pattern=r"^(#[0-9a-fA-F]{6})?$")
+    accentColor: Optional[str] = Field(default=None, pattern=r"^(#[0-9a-fA-F]{6})?$")
 
 
 class UploadLogoResponse(BaseModel):
@@ -287,12 +291,32 @@ class GenerateImageRequest(BaseModel):
     size: Optional[str] = Field(default="1024x1024", pattern=r"^\d+x\d+$")
     mode: str = Field(default="create", pattern=r"^(create|edit)$")
     sourceImageUrl: Optional[str] = None
+    format: Optional[str] = Field(default=None, pattern=r"^(post|banner|story|carousel|quote|product)$")
+    platform: Optional[SocialPlatform] = None
+    headline: Optional[str] = Field(default=None, max_length=160)
+    subtext: Optional[str] = Field(default=None, max_length=220)
+    cta: Optional[str] = Field(default=None, max_length=40)
+    caption: Optional[str] = Field(default=None, max_length=3000)
+    textOverlay: bool = False
+    autoCopy: bool = True
+    includeLogo: bool = True
+    logoPosition: str = Field(default="top-right", pattern=r"^(top|bottom)-(left|right)$")
+    useBrand: bool = True
+    slideIndex: Optional[int] = Field(default=None, ge=1, le=20)
+    slideCount: Optional[int] = Field(default=None, ge=1, le=20)
 
 
 class GenerateImageResponse(BaseModel):
     imageUrl: str
     source: str
     assetId: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    format: Optional[str] = None
+    headline: Optional[str] = None
+    subtext: Optional[str] = None
+    cta: Optional[str] = None
+    logoApplied: bool = False
 
 
 class GenerateVideoRequest(BaseModel):

@@ -7,7 +7,10 @@ import logging
 import math
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from app.social.ai.creative import CreativeResult, CreativeSpec
 
 logger = logging.getLogger(__name__)
 
@@ -560,7 +563,6 @@ class SocialMediaService:
         cta: Optional[str] = None,
     ) -> SocialPostOut:
         from app.plans.service import record_ai_usage
-        from app.social.ai.image_generator import generate_post_image
         from app.social.limits import enforce_ai_image_limit, enforce_ai_text_limit
         from app.social.media import upload_social_image_bytes
         from app.social.polish import SocialPolishService
@@ -637,26 +639,24 @@ class SocialMediaService:
         if prompt:
             update_kwargs["aiPrompt"] = prompt.strip()
 
-        image_caption_hint = caption[:180] if caption else topic[:180]
-
         if regenerate_image:
             try:
+                from app.social.ai.creative import CreativeSpec
+
                 enforce_ai_image_limit(self.db, workspace)
                 image_style = settings.get("imageGenerationStyle")
-                img_data = generate_post_image(
-                    topic=f"Social media image for: {image_caption_hint}",
-                    style=image_style,
-                    size="1024x1024",
-                    mode="create",
+                creative = self.render_brand_creative(
+                    workspace,
+                    topic,
+                    image_style,
+                    CreativeSpec(format="post", platform=platform.value, caption=caption, auto_copy=False),
                 )
                 record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"])
-                upload = None
-                if img_data.get("imageB64"):
-                    upload = upload_social_image_bytes(
-                        workspace["id"],
-                        img_data["imageB64"],
-                        content_type="image/png",
-                    )
+                upload = upload_social_image_bytes(
+                    workspace["id"],
+                    creative.image,
+                    content_type="image/jpeg",
+                )
                 if upload:
                     self._record_media_asset(
                         workspace,
@@ -1143,6 +1143,10 @@ class SocialMediaService:
         }
         if payload.logoUrl is not None:
             updates["logo_url"] = payload.logoUrl.strip() or None
+        if payload.primaryColor is not None:
+            updates["primary_color"] = payload.primaryColor or None
+        if payload.accentColor is not None:
+            updates["accent_color"] = payload.accentColor or None
         row = self.db["social_brand_voices"].find_one_and_update(
             {"workspace_id": workspace["id"]},
             {"$set": updates, "$setOnInsert": {"id": new_id()}},
@@ -1421,6 +1425,7 @@ class SocialMediaService:
         *,
         mode: str = "create",
         source_image_url: Optional[str] = None,
+        creative: Optional["CreativeSpec"] = None,
     ) -> GenerateImageResponse:
         from app.social.media import (
             SocialBlobUpload,
@@ -1437,6 +1442,33 @@ class SocialMediaService:
             org_settings = self.db["social_settings"].find_one({"workspace_id": workspace["id"]})
             if org_settings and org_settings.get("image_generation_style"):
                 style = org_settings["image_generation_style"]
+
+        if creative is not None and mode == "create":
+            result = self.render_brand_creative(workspace, topic, style, creative)
+            upload = upload_social_image_bytes(workspace["id"], result.image, content_type="image/jpeg")
+            asset = self._record_media_asset(
+                workspace, user,
+                media_type=SocialMediaAssetType.IMAGE,
+                source=SocialImageSource.AI_GENERATED,
+                blob_key=upload.blob_key,
+                blob_url=upload.url,
+                mime_type=upload.content_type,
+                file_size_bytes=upload.file_size,
+                prompt=topic,
+            )
+            record_ai_usage(self.db, workspace["id"], "image", user_id=user["id"] if user else None)
+            return GenerateImageResponse(
+                imageUrl=upload.url,
+                source="ai_generated",
+                assetId=str(asset["id"]),
+                width=result.width,
+                height=result.height,
+                format=creative.format,
+                headline=result.copy.headline or None,
+                subtext=result.copy.subtext or None,
+                cta=result.copy.cta or None,
+                logoApplied=result.logo_applied,
+            )
 
         data = generate_post_image_from_url(
             topic=topic,
@@ -1602,9 +1634,46 @@ class SocialMediaService:
             "primary_language": row.get("primary_language", "en"),
             "system_prompt_override": row.get("system_prompt_override"),
             "logo_url": row.get("logo_url"),
+            "primary_color": row.get("primary_color"),
+            "accent_color": row.get("accent_color"),
         }
 
+    def _load_logo_bytes(self, workspace_id: str, logo_url: Optional[str]) -> Optional[bytes]:
+        from app.providers.storage.factory import get_storage_provider
+        from app.social.media import blob_key_from_url
+
+        key = blob_key_from_url(logo_url) if logo_url else None
+        if not key or not key.startswith(f"logos/{workspace_id}/"):
+            return None
+        try:
+            return get_storage_provider().download_bytes(key)
+        except Exception as exc:
+            logger.warning("Logo download failed for workspace %s: %s", workspace_id, exc)
+            return None
+
+    def render_brand_creative(
+        self,
+        workspace: dict,
+        topic: str,
+        style: Optional[str],
+        spec: "CreativeSpec",
+    ) -> "CreativeResult":
+        from app.social.ai.creative import render_creative
+
+        brand = self._brand_voice_dict(workspace["id"]) if spec.use_brand else {}
+        logo_bytes = (
+            self._load_logo_bytes(workspace["id"], brand.get("logo_url"))
+            if spec.include_logo and brand.get("logo_url")
+            else None
+        )
+        try:
+            return render_creative(topic=topic, style=style, spec=spec, brand=brand, logo_bytes=logo_bytes)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
     def _serialize_brand_voice(self, row: dict) -> BrandVoiceOut:
+        from app.social.media import resolve_stored_image_url
+
         return BrandVoiceOut(
             id=str(row["id"]),
             workspaceId=str(row.get("workspace_id")),
@@ -1620,7 +1689,9 @@ class SocialMediaService:
             emojiUsage=row.get("emoji_usage"),
             primaryLanguage=row.get("primary_language", "en"),
             systemPromptOverride=row.get("system_prompt_override"),
-            logoUrl=row.get("logo_url"),
+            logoUrl=resolve_stored_image_url(row.get("logo_url")),
+            primaryColor=row.get("primary_color"),
+            accentColor=row.get("accent_color"),
             updatedAt=_iso(row.get("updated_at")),
         )
 

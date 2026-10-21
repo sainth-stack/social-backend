@@ -650,6 +650,25 @@ def generate_image(
     db: Database = Depends(get_db),
     user: dict = Depends(get_current_user),
 ) -> GenerateImageResponse:
+    from app.social.ai.creative import CreativeSpec
+
+    creative = None
+    if payload.format:
+        creative = CreativeSpec(
+            format=payload.format,
+            platform=payload.platform.value if payload.platform else None,
+            headline=payload.headline or "",
+            subtext=payload.subtext or "",
+            cta=payload.cta or "",
+            text_overlay=payload.textOverlay,
+            auto_copy=payload.autoCopy,
+            include_logo=payload.includeLogo,
+            logo_position=payload.logoPosition,
+            use_brand=payload.useBrand,
+            caption=payload.caption or "",
+            slide_index=payload.slideIndex,
+            slide_count=payload.slideCount,
+        )
     return SocialMediaService(db).generate_image(
         workspace,
         user,
@@ -658,6 +677,7 @@ def generate_image(
         payload.size,
         mode=payload.mode,  # type: ignore[arg-type]
         source_image_url=payload.sourceImageUrl,
+        creative=creative,
     )
 
 

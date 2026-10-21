@@ -63,6 +63,7 @@ def generate_post_image(
     size: str = "1024x1024",
     mode: ImageGenerationMode = "create",
     source_image_bytes: Optional[bytes] = None,
+    prompt_override: Optional[str] = None,
 ) -> dict[str, str | bytes]:
     if not image_generation_configured():
         raise HTTPException(
@@ -92,7 +93,7 @@ def generate_post_image(
                 quality=quality,
             )
         else:
-            prompt = _build_create_prompt(topic, style)
+            prompt = prompt_override or _build_create_prompt(topic, style)
             image_bytes = generate_text_to_image(
                 prompt=prompt,
                 size=size,
