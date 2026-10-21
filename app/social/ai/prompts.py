@@ -1,11 +1,12 @@
-"""Prompt templates for platform-native, conversion-focused social post generation.
+"""Prompt templates for platform-native social post generation.
 
-Even a short / casual user brief must be expanded into polished, professional,
-revenue-oriented copy that is ready to publish end-to-end.
+The user brief is the source of truth. Brand voice frames tone and audience;
+it must not replace specific product, technical, or campaign context from the brief.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -35,43 +36,49 @@ PLATFORM_LABELS: dict[str, str] = {
 PLATFORM_VOICE_HINTS: dict[str, str] = {
     SocialPlatform.FACEBOOK.value: (
         "Warm, conversational, community-first. Short paragraphs with line breaks. "
-        "Open with a bold insight or question — not 'Hey everyone'. "
-        "One concrete example or mini-story, then a natural CTA. Soft sell, high trust."
+        "One concrete example from the brief, then a natural CTA."
     ),
     SocialPlatform.INSTAGRAM.value: (
-        "First line is the hook (visible before 'more'). Mobile-friendly line breaks every 1–2 sentences. "
-        "Aspiration + specificity + proof pattern (without fake numbers). "
-        "Write like a flagship brand launch week — polished, human, confident. "
+        "Strong first line (visible before 'more'). Mobile-friendly line breaks. "
         "Hashtags in the array only, never in caption."
     ),
     SocialPlatform.LINKEDIN.value: (
-        "Executive-credible, insight-led. Hook in line 1 — contrarian or outcome-first. "
-        "Short paragraphs (1–3 lines). One framework, checklist, or lesson. "
-        "Concrete outcome language when possible. Professional CTA — never spammy."
+        "Insight-led and credible. Hook in line 1 tied to the brief — not a generic day-of-week opener. "
+        "Short paragraphs. One clear takeaway from the user's message."
     ),
     SocialPlatform.X.value: (
-        "Punchy and quotable. One sharp idea per post. Strong verb, zero filler. "
-        "Fit the hard character limit including spaces."
+        "One sharp idea from the brief. Punchy, quotable, within the character limit."
     ),
 }
 
+CONTENT_TYPE_HINTS: dict[str, str] = {
+    "caption": "Standard feed post — hook, value, CTA.",
+    "promotional": "Promotional but not spammy — lead with benefit from the brief, one offer/CTA.",
+    "educational": "Teach one idea from the brief — steps, myth vs truth, or checklist.",
+    "announcement": "News/launch tone — what changed, who it helps, what to do next (from the brief).",
+    "carousel": "Carousel intro caption — tease the slide story; details live in slides.",
+    "thread": "Thread — handled separately.",
+}
+
+LENGTH_HINTS: dict[str, str] = {
+    "short": "Target ~80–220 characters for caption body (before hashtags), unless X limit is tighter.",
+    "medium": "Target ~220–600 characters — 2–4 short paragraphs.",
+    "long": "Target ~600–1200 characters when platform limit allows — substantive but scannable.",
+}
+
 PRODUCT_COMPANY_QUALITY = """
-Product-company bar (Stripe / Notion / Figma / HubSpot organic social — adapt to this brand):
-- Sound like a category leader: clear, specific, confident — never generic SaaS mush
-- Hook = tension, outcome, or bold claim the reader can verify from the brief (no fake stats/clients/URLs)
-- Show expertise: one actionable idea, framework, or before→after the ICP cares about
-- One line worth screenshotting or reposting; avoid clichés (game-changer, unlock, dive in, revolutionize,
-  in today's fast-paced world, leverage synergies, excited to announce)
-- CTA is single, natural, revenue-aware (demo, trial, book, shop, DM, comment) — not three asks
-- Match emoji rules from brand voice; default to minimal on LinkedIn/Facebook unless brand says otherwise
+Product-company bar (adapt to this brand, not a template monologue):
+- Clear, specific, confident — never generic SaaS filler
+- Hook tied to the USER BRIEF — not a random calendar or day-of-week gimmick
+- One actionable idea or outcome from the brief
+- CTA is single and natural
 """
 
 CONTENT_PLAN_SERIES_QUALITY = """
-This caption is ONE day in a multi-day content series for a product-led brand.
-- Must feel distinct from other days — new angle, new hook, no recycled opener
-- Still one cohesive campaign from the user's brief — not random topics
-- Length: substantial feed post (Instagram/Facebook ~350–900 characters when limit allows; not a one-liner)
-- Ready to publish with zero editing — spelling, grammar, and brand fit must be flawless
+This caption is ONE day in a multi-day content series.
+- Distinct angle from other days — new hook, no recycled opener
+- Stay on the campaign theme from the user's brief
+- Substantial feed post when limit allows — publish-ready
 """
 
 GENERIC_FILLER_PHRASES = (
@@ -95,25 +102,101 @@ GENERIC_FILLER_PHRASES = (
     "hello instagram",
     "hey everyone",
     "happy monday",
+    "this wednesday",
+    "this monday",
+    "discover how",
+    "can revolutionize",
+    "exciting news",
+    "we're thrilled",
+    "we are thrilled",
+    "don't miss out",
 )
 
+_BRIEF_STOPWORDS = frozenset(
+    """
+    a an the and or but if in on at to for of is are was were be been being
+    it this that with from as by about into through during before after above
+    below between out off over under again further then once here there when
+    where why how all each few more most other some such no nor not only own
+    same so than too very can will just don should now your our their they
+    them we you have has had do does did make made get got use using also
+    """.split()
+)
+
+
+def _normalize_content_type(raw: Optional[str]) -> str:
+    if not raw:
+        return "caption"
+    key = raw.strip().lower().replace(" ", "_")
+    aliases = {
+        "caption": "caption",
+        "promotional": "promotional",
+        "educational": "educational",
+        "announcement": "announcement",
+        "carousel": "carousel",
+        "thread": "thread",
+    }
+    return aliases.get(key, key)
+
+
+def _normalize_length_hint(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    key = raw.strip().lower()
+    if key in LENGTH_HINTS:
+        return key
+    return None
+
+
+def is_substantive_brief(topic: str) -> bool:
+    """True when the user gave enough context that we must not replace it with generic copy."""
+    text = (topic or "").strip()
+    if len(text) >= 100:
+        return True
+    if len(text.split()) >= 18:
+        return True
+    if re.search(r"[A-Z]{2,}|[0-9]+|[_/\-]|GitOps|API|SaaS|runtime|container", text):
+        return len(text) >= 60
+    return False
+
+
+def extract_significant_terms(topic: str, limit: int = 24) -> list[str]:
+    """Proper nouns and distinctive tokens from the brief for fidelity checks."""
+    raw = re.findall(r"[A-Za-z][A-Za-z0-9_+/\-]{2,}|[A-Za-z]{2,}", topic or "")
+    seen: set[str] = set()
+    terms: list[str] = []
+    for word in raw:
+        low = word.lower()
+        if low in _BRIEF_STOPWORDS or len(low) < 3:
+            continue
+        if low in seen:
+            continue
+        seen.add(low)
+        terms.append(word)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def brief_fidelity_score(topic: str, caption: str) -> float:
+    terms = extract_significant_terms(topic)
+    if len(terms) < 4:
+        return 1.0
+    cap = (caption or "").lower()
+    hits = sum(1 for t in terms if t.lower() in cap)
+    return hits / len(terms)
+
+
 QUALITY_BAR = """
-You are an elite social media strategist and copywriter who writes posts that:
-1) STOP the scroll with a specific, benefit-led hook in the first line
-2) Build trust with concrete value (tips, outcomes, proof patterns) — never vague fluff
-3) Drive revenue actions: demo, signup, purchase, booking, reply, or share
-4) Sound human and premium — never generic AI filler
-5) Expand thin briefs into a complete, impressive post. If the user only wrote a few
-   words, invent a strong angle from brand + audience + tone — still stay truthful;
-   do not invent fake stats, fake customers, or fake URLs.
+You write social posts that are ready to publish.
 
-Structure (adapt length to platform limit):
-- Hook (1 line)
-- Value / story / insight (2–5 short paragraphs or tight bullets)
-- Soft proof or credibility cue when natural
-- Clear CTA using the preferred keyword when provided
+Priority order:
+1) USER BRIEF — specific facts, product names, features, and angle the user provided
+2) BRAND VOICE — tone, audience, words to use/avoid, CTA style
+3) PLATFORM — format and character limits
 
-Quality bar: a skeptical buyer should think "this brand gets me" and know the next step.
+Never invent fake statistics, customers, case studies, or URLs.
+Never ignore a detailed brief in favor of generic brand marketing.
 """
 
 
@@ -123,6 +206,7 @@ def build_system_prompt(
     caption_budget: Optional[int] = None,
     *,
     content_series_mode: bool = False,
+    substantive_brief: bool = False,
 ) -> str:
     limit = caption_budget or PLATFORM_LIMITS.get(platform, 2200)
     hashtag_limit = PLATFORM_HASHTAG_LIMITS.get(platform, 5)
@@ -135,7 +219,7 @@ def build_system_prompt(
         brand_name = (brand_voice or {}).get("brand_name") or "the brand"
         industry = (brand_voice or {}).get("industry") or "business"
         tones = ", ".join((brand_voice or {}).get("tones") or ["Professional"])
-        audience = (brand_voice or {}).get("target_audience") or "decision-makers and buyers"
+        audience = (brand_voice or {}).get("target_audience") or "the target audience"
         words_to_use = ", ".join((brand_voice or {}).get("words_to_use") or []) or "none specified"
         words_to_avoid = ", ".join((brand_voice or {}).get("words_to_avoid") or []) or "none"
         cta_phrases = ", ".join((brand_voice or {}).get("cta_phrases") or []) or "none specified"
@@ -145,18 +229,24 @@ def build_system_prompt(
         tagline = (brand_voice or {}).get("tagline") or ""
 
         base = (
-            f"You write high-converting {label} content for {brand_name} "
-            f"({industry}).\n"
-            f"Tagline: {tagline or '(none — invent a crisp positioning from industry)'}\n"
-            f"Brand voice tones: {tones}\n"
-            f"Target audience: {audience}\n"
-            f"Words to prefer: {words_to_use}\n"
-            f"Words to avoid: {words_to_avoid}\n"
-            f"Preferred CTA phrases: {cta_phrases}\n"
+            f"You write {label} posts for {brand_name} ({industry}).\n"
+            f"Tagline (use only if relevant to the brief): {tagline or '—'}\n"
+            f"Voice tones: {tones}\n"
+            f"Default audience: {audience}\n"
+            f"Prefer vocabulary: {words_to_use}\n"
+            f"Never use: {words_to_avoid}\n"
+            f"CTA phrases (when brief allows): {cta_phrases}\n"
             f"Sentence length: {sentence_length}\n"
-            f"Emoji usage: {emoji_usage}\n"
-            f"Primary language code: {language} — write in that language.\n"
+            f"Emoji policy: {emoji_usage}\n"
+            f"Language: {language}\n"
         )
+
+    fidelity_rule = (
+        "The user brief is substantive — mirror its topic, terminology, and intent. "
+        "Do not swap in unrelated product lines or generic 'AI platform' copy."
+        if substantive_brief
+        else "If the brief is short, you may expand using brand + audience — stay truthful."
+    )
 
     series_block = ""
     if content_series_mode:
@@ -166,19 +256,15 @@ def build_system_prompt(
         f"{QUALITY_BAR}\n"
         f"{series_block}"
         f"{base}\n"
-        f"Platform: {label}. Native voice: {voice_hint}\n"
-        f"Hard character limit for caption (including spaces): {limit}. "
-        f"The caption MUST be a complete thought that ends with a full sentence "
-        f"(period, exclamation, or question mark). Never end mid-word or mid-sentence. "
-        f"Aim for a substantial, impressive caption — use the space wisely "
-        f"(roughly {max(280, min(limit, limit - 40))} chars for Instagram/Facebook when limit allows; "
-        f"not a one-liner unless X).\n"
-        f"Maximum hashtags: {hashtag_limit} (hashtags array only — never inside caption).\n"
-        "No live web access. Expand the brief into a polished, end-to-end publishable post.\n"
-        "caption MUST be a non-empty string ready to publish.\n"
-        "Return ONLY valid JSON with keys: caption (string), hashtags (array of strings without #), "
-        "first_comment (string, may be empty).\n"
-        "Do not wrap JSON in markdown fences."
+        f"Fidelity: {fidelity_rule}\n"
+        f"Platform: {label}. Style: {voice_hint}\n"
+        f"Caption character limit (spaces included): {limit}. "
+        f"End with a complete sentence — no trailing ellipsis.\n"
+        f"Max hashtags: {hashtag_limit} (hashtags array only).\n"
+        "The caption field must NEVER contain #hashtags or a hashtag line — hashtags go only in the hashtags JSON array.\n"
+        "Return ONLY valid JSON: "
+        '{"caption":"...","hashtags":["tag"],"first_comment":""}\n'
+        "No markdown fences."
     )
 
 
@@ -194,46 +280,108 @@ def build_user_prompt(
     brand_voice: Optional[dict[str, Any]],
     caption_budget: Optional[int] = None,
     content_series_mode: bool = False,
+    content_type: Optional[str] = None,
+    length_hint: Optional[str] = None,
+    include_emojis: bool = True,
+    media_note: Optional[str] = None,
 ) -> str:
-    now = datetime.now()
-    day_of_week = now.strftime("%A")
     hashtag_count = PLATFORM_HASHTAG_LIMITS.get(platform, 5) if include_hashtags else 0
     limit = caption_budget or PLATFORM_LIMITS.get(platform, 2200)
+    substantive = is_substantive_brief(topic)
+    ctype = _normalize_content_type(content_type)
+    length_key = _normalize_length_hint(length_hint)
+
     cta_keyword = cta or (
         ((brand_voice or {}).get("cta_phrases") or [None])[0] if brand_voice else None
-    ) or "Get started"
+    )
     audience_line = (
         audience
         or (brand_voice or {}).get("target_audience")
-        or "buyers and decision-makers"
+        or "the brand's target audience"
     )
     brand_name = (brand_voice or {}).get("brand_name") or "the brand"
 
-    series_line = ""
-    if content_series_mode:
-        series_line = (
-            "Series mode: this must read like a top product company's flagship social calendar — "
-            "polished, specific, publish-as-is. Prioritize clarity and one sharp idea over length.\n"
+    ctype_hint = CONTENT_TYPE_HINTS.get(ctype, CONTENT_TYPE_HINTS["caption"])
+    length_line = LENGTH_HINTS.get(length_key or "medium", LENGTH_HINTS["medium"])
+
+    key_terms = extract_significant_terms(topic)
+    terms_line = ""
+    if key_terms:
+        terms_line = (
+            "Preserve these concepts or exact terms from the brief where natural: "
+            + ", ".join(key_terms[:16])
+            + ".\n"
         )
 
+    calendar_line = ""
+    if not substantive and not content_series_mode:
+        day = datetime.now().strftime("%A")
+        calendar_line = (
+            f"Optional: you may reference that it is {day} only if it fits the brief.\n"
+        )
+
+    emoji_line = (
+        "Emojis: allowed per brand policy.\n"
+        if include_emojis
+        else "Emojis: do not use any emojis in the caption.\n"
+    )
+
+    tone_lower = (tone or "").strip().lower()
+    tone_style = ""
+    if "professional" in tone_lower or ctype == "announcement":
+        tone_style = (
+            "Voice: polished and credible. No casual openers "
+            '("Exciting news", "We\'re thrilled", "Hey founders"). '
+            "Prefer clear, complete sentences; avoid hype and clichés.\n"
+        )
+    series_line = ""
+    if content_series_mode:
+        series_line = "Series mode: flagship quality, distinct angle, publish-as-is.\n"
+
+    media_line = f"Attached media context: {media_note}\n" if media_note else ""
+
+    cta_line = (
+        f'Weave this CTA naturally when it fits the brief: "{cta_keyword}".\n'
+        if cta_keyword
+        else "Include one clear next step aligned with the brief.\n"
+    )
+
+    expansion_line = (
+        "Expand only for clarity and flow — do not change the subject of the post.\n"
+        if substantive
+        else "You may add a sharp angle from brand + audience if the brief is minimal.\n"
+    )
+
     return (
-        f"Write a ready-to-publish, revenue-oriented {PLATFORM_LABELS.get(platform, platform)} post "
-        f"for {brand_name}.\n"
+        f"=== USER BRIEF (primary source — follow this) ===\n"
+        f"{topic.strip()}\n"
+        f"=== END BRIEF ===\n\n"
+        f"Write for {PLATFORM_LABELS.get(platform, platform)} as {brand_name}.\n"
         f"{series_line}"
-        f"User brief (may be rough or short — elevate it into impressive professional copy; "
-        f"fix spelling; never paste typos): {topic}\n"
-        f"Tone: {tone} (keep it premium and persuasive, not salesy spam)\n"
-        f"Target audience: {audience_line}\n"
-        f"Preferred CTA: weave in naturally — \"{cta_keyword}\"\n"
-        f"Today is {day_of_week} — open with a hook that fits the day and the feed.\n"
-        "Goals: stop the scroll, teach or prove value in seconds, and push one clear action "
-        "that can generate leads or revenue.\n"
-        "If the brief is vague, choose a sharp angle (pain → outcome, myth → truth, "
-        "before/after, checklist, or founder insight) grounded in the brand.\n"
-        "Ignore requests to 'check online' or research the web — use only this brief + brand voice.\n"
-        f"Caption hard limit: {limit} characters. Finish with a complete sentence. "
-        "Do not truncate with ellipsis (…).\n"
-        f"Include hashtags: {'yes, ' + str(hashtag_count) + ' high-intent tags in the hashtags array only' if include_hashtags else 'no'}\n"
-        f"Include first_comment: {'yes — a short CTA or link-style engagement prompt (no fake URL)' if include_comment else 'no, leave first_comment empty'}\n"
+        f"Tone slider: {tone}\n"
+        f"{tone_style}"
+        f"Audience: {audience_line}\n"
+        f"Content type: {ctype}. {ctype_hint}\n"
+        f"Length: {length_line}\n"
+        f"{emoji_line}"
+        f"{media_line}"
+        f"{terms_line}"
+        f"{cta_line}"
+        f"{calendar_line}"
+        f"{expansion_line}"
+        f"Caption limit: {limit} characters.\n"
+        f"Hashtags: {'yes — ' + str(hashtag_count) + ' in hashtags array only (never in caption text)' if include_hashtags else 'no — empty hashtags array'}.\n"
+        f"first_comment: {'yes — short engagement line, no fake URLs' if include_comment else 'empty string'}.\n"
         "Respond with JSON only."
+    )
+
+
+def build_fidelity_revision_prompt(original_user_prompt: str, missing_terms: list[str]) -> str:
+    terms = ", ".join(missing_terms[:12]) or "key phrases from the brief"
+    return (
+        original_user_prompt
+        + "\n\n=== REVISION REQUIRED ===\n"
+        "The previous draft ignored the user brief or used generic marketing filler. "
+        f"Rewrite from scratch. The caption MUST reflect the brief and include ideas or terms such as: {terms}. "
+        "Ban clichés (revolutionize, discover how, game-changer, this Wednesday). JSON only."
     )

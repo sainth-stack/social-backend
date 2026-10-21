@@ -5,7 +5,8 @@ Three tiers (DB keys kept for compatibility):
   - growth   → Pro
   - enterprise → Growth
 
-New registrations always land on Free. Paid plans are admin-assigned only.
+New registrations always land on Free. Pro (₹499/mo) and Growth (₹999/mo) via Razorpay checkout
+or admin assignment / coupons.
 """
 
 from __future__ import annotations

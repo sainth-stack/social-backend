@@ -1263,10 +1263,18 @@ class SocialMediaService:
 
         platforms = [p.value for p in payload.platforms]
         result = generate_platform_content(
-            topic=payload.topic, tone=payload.tone, platforms=platforms,
-            audience=payload.audience, cta=payload.cta,
-            include_hashtags=payload.includeHashtags, include_comment=payload.includeComment,
+            topic=payload.topic,
+            tone=payload.tone,
+            platforms=platforms,
+            audience=payload.audience,
+            cta=payload.cta,
+            include_hashtags=payload.includeHashtags,
+            include_comment=payload.includeComment,
             brand_voice=brand_voice,
+            content_type=payload.contentType,
+            length_hint=payload.length,
+            include_emojis=payload.includeEmojis,
+            media_note=payload.mediaNote,
         )
         return GeneratePostResponse(
             format=fmt,

@@ -6,12 +6,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.admin.router import router as admin_router
+from app.billing.router import admin_coupons_router
+from app.billing.router import router as billing_router
+from app.billing.router import webhooks_router as billing_webhooks_router
 from app.auth.router import router as auth_router
 from app.core.bootstrap import seed_platform_admin
 from app.core.config import settings
 from app.core.database import init_db
 from app.core.exceptions import register_exception_handlers
 from app.core.logging_config import configure_logging
+from app.core.request_logging import RequestLoggingMiddleware
 from app.plans.router import router as plans_router
 from app.social.router import oauth_callback_router as social_oauth_callback_router
 from app.social.router import router as social_router
@@ -36,6 +40,7 @@ def create_app() -> FastAPI:
     )
 
     register_exception_handlers(app)
+    app.add_middleware(RequestLoggingMiddleware)
 
     allow_origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
     if "*" in allow_origins and not settings.debug:
@@ -94,6 +99,9 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix=settings.api_v1_prefix)
     app.include_router(workspaces_router, prefix=settings.api_v1_prefix)
     app.include_router(plans_router, prefix=settings.api_v1_prefix)
+    app.include_router(billing_router, prefix=settings.api_v1_prefix)
+    app.include_router(billing_webhooks_router, prefix=settings.api_v1_prefix)
+    app.include_router(admin_coupons_router, prefix=settings.api_v1_prefix)
     app.include_router(admin_router, prefix=settings.api_v1_prefix)
     app.include_router(social_router, prefix=settings.api_v1_prefix)
     app.include_router(social_oauth_callback_router)

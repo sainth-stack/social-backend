@@ -10,11 +10,16 @@ from typing import Any, Optional
 
 from fastapi import HTTPException, status
 
+from app.social.ai.caption_sanitize import sanitize_caption_and_hashtags
 from app.social.ai.prompts import (
     GENERIC_FILLER_PHRASES,
     PLATFORM_LIMITS,
+    brief_fidelity_score,
+    build_fidelity_revision_prompt,
     build_system_prompt,
     build_user_prompt,
+    extract_significant_terms,
+    is_substantive_brief,
 )
 from app.social.models import SocialPlatform
 
@@ -307,6 +312,10 @@ def _generate_one_platform(
     include_comment: bool,
     brand_voice: Optional[dict[str, Any]],
     content_series_mode: bool = False,
+    content_type: Optional[str] = None,
+    length_hint: Optional[str] = None,
+    include_emojis: bool = True,
+    media_note: Optional[str] = None,
 ) -> tuple[str, dict[str, Any]]:
     limit = PLATFORM_LIMITS.get(platform_key, 2200)
     hashtag_limit = 30 if platform_key == SocialPlatform.INSTAGRAM.value else 5
@@ -317,13 +326,20 @@ def _generate_one_platform(
         caption_budget = max(120, limit - 36)
 
     series_mode = content_series_mode
-    temp = 0.55 if series_mode else None
+    substantive = is_substantive_brief(topic)
+    if substantive:
+        temp = 0.35
+    elif series_mode:
+        temp = 0.5
+    else:
+        temp = 0.45
 
     system_prompt = build_system_prompt(
         brand_voice,
         platform_key,
         caption_budget=caption_budget,
         content_series_mode=series_mode,
+        substantive_brief=substantive,
     )
     user_prompt = build_user_prompt(
         topic=topic,
@@ -336,6 +352,10 @@ def _generate_one_platform(
         brand_voice=brand_voice,
         caption_budget=caption_budget,
         content_series_mode=series_mode,
+        content_type=content_type,
+        length_hint=length_hint,
+        include_emojis=include_emojis,
+        media_note=media_note,
     )
 
     def _run(user: str) -> str:
@@ -366,19 +386,33 @@ def _generate_one_platform(
     )
     first_comment = first_comment_raw.strip() if include_comment else ""
 
+    caption_raw, hashtags = sanitize_caption_and_hashtags(
+        caption_raw,
+        hashtags,
+        hashtag_limit=hashtag_limit if include_hashtags else 0,
+    )
     tags_text = ""
     if hashtags:
         tags_text = " " + " ".join(f"#{t}" for t in hashtags)
     caption = _trim_caption(caption_raw, max(1, limit - len(tags_text)))
 
-    if series_mode and caption and _caption_needs_polish(caption, platform_key):
-        logger.info("Social generate polish retry for %s (weak first draft)", platform_key)
-        polish_user = (
-            user_prompt
-            + "\n\nREVISION: The first draft was too short or generic. Rewrite at flagship "
-            "product-company quality — specific hook, concrete value, ~350–900 characters for "
-            "Instagram/Facebook if limit allows. Ban clichés. JSON only."
-        )
+    fidelity_low = substantive and brief_fidelity_score(topic, caption) < 0.22
+    needs_polish = caption and (
+        _caption_needs_polish(caption, platform_key) or fidelity_low
+    )
+    if needs_polish:
+        reason = "low brief fidelity" if fidelity_low else "weak first draft"
+        logger.info("Social generate polish retry for %s (%s)", platform_key, reason)
+        missing = [
+            t
+            for t in extract_significant_terms(topic)
+            if t.lower() not in (caption or "").lower()
+        ]
+        polish_user = build_fidelity_revision_prompt(user_prompt, missing)
+        if series_mode and not fidelity_low:
+            polish_user += (
+                "\nAlso aim for ~350–900 characters on Instagram/Facebook when limit allows."
+            )
         try:
             raw2 = _run(polish_user)
             parsed2 = _parse_json_content(raw2)
@@ -386,11 +420,21 @@ def _generate_one_platform(
             hashtags2 = (
                 _normalize_hashtags(tags2, hashtag_limit) if include_hashtags else []
             )
+            cap2, hashtags2 = sanitize_caption_and_hashtags(
+                cap2,
+                hashtags2,
+                hashtag_limit=hashtag_limit if include_hashtags else 0,
+            )
             tags_text2 = ""
             if hashtags2:
                 tags_text2 = " " + " ".join(f"#{t}" for t in hashtags2)
             caption2 = _trim_caption(cap2, max(1, limit - len(tags_text2)))
-            if caption2 and not _caption_needs_polish(caption2, platform_key):
+            score2 = brief_fidelity_score(topic, caption2)
+            better = caption2 and (
+                (fidelity_low and score2 >= 0.22)
+                or (not fidelity_low and not _caption_needs_polish(caption2, platform_key))
+            )
+            if better:
                 caption = caption2
                 hashtags = hashtags2
                 first_comment = fc2.strip() if include_comment else first_comment
@@ -433,6 +477,10 @@ def generate_platform_content(
     include_comment: bool,
     brand_voice: Optional[dict[str, Any]],
     content_series_mode: bool = False,
+    content_type: Optional[str] = None,
+    length_hint: Optional[str] = None,
+    include_emojis: bool = True,
+    media_note: Optional[str] = None,
 ) -> dict[str, dict[str, Any]]:
     """Return { platform: { caption, hashtags, firstComment, characterCount } }.
 
@@ -488,6 +536,10 @@ def generate_platform_content(
                 include_comment=include_comment,
                 brand_voice=brand_voice,
                 content_series_mode=content_series_mode,
+                content_type=content_type,
+                length_hint=length_hint,
+                include_emojis=include_emojis,
+                media_note=media_note,
             ): key
             for key in platform_keys
         }
@@ -600,8 +652,10 @@ def generate_carousel_content(
         "]}"
     )
     user_prompt = (
-        f"Create a {num_slides}-slide LinkedIn/Instagram carousel about:\n{topic}\n"
+        f"=== USER BRIEF (primary source) ===\n{topic.strip()}\n=== END BRIEF ===\n\n"
+        f"Create a {num_slides}-slide LinkedIn/Instagram carousel from this brief.\n"
         f"Tone: {tone}.{brand_note}{audience_note}{cta_note}\n"
+        f"Every slide must reflect the brief — do not replace with generic marketing.\n"
         f"Rules:\n"
         f"- Slide 1: scroll-stopping hook / painful problem\n"
         f"- Slides 2-{num_slides - 1}: one concrete insight, tip, or step (specific, useful)\n"
@@ -671,7 +725,8 @@ def generate_thread_content(
         'Schema: {"tweets":[{"text":"<tweet text, max 270 chars>"}],"hashtags":["tag1","tag2"]}'
     )
     user_prompt = (
-        f"Write a {num_tweets}-tweet thread about:\n{topic}\n"
+        f"=== USER BRIEF (primary source) ===\n{topic.strip()}\n=== END BRIEF ===\n\n"
+        f"Write a {num_tweets}-tweet thread from this brief.\n"
         f"Tone: {tone}.{brand_note}{audience_note}{cta_note}\n"
         "Rules:\n"
         "- Tweet 1: arresting hook (specific pain, bold claim, or curiosity gap)\n"
@@ -736,7 +791,8 @@ def generate_poll_content(
         '"caption":"<intro text to post above poll, max 300 chars>","hashtags":["tag1","tag2"]}'
     )
     user_prompt = (
-        f"Create an engaging poll about:\n{topic}\n"
+        f"=== USER BRIEF (primary source) ===\n{topic.strip()}\n=== END BRIEF ===\n\n"
+        f"Create an engaging poll from this brief.\n"
         f"Tone: {tone}.{brand_note}{audience_note}\n"
         "Rules:\n"
         "- Question must spark debate or reveal a buying preference\n"

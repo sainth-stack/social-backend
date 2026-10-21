@@ -170,6 +170,19 @@ class Settings(BaseSettings):
         default="noreply@opsbrainai.com", validation_alias="RESEND_FROM_EMAIL"
     )
 
+    # ── Billing — Razorpay (Pro ₹499 / Growth ₹999 per month) ─────────────────
+    razorpay_key_id: Optional[str] = Field(default=None, validation_alias="RAZORPAY_KEY_ID")
+    razorpay_key_secret: Optional[str] = Field(
+        default=None, validation_alias="RAZORPAY_KEY_SECRET"
+    )
+    razorpay_webhook_secret: Optional[str] = Field(
+        default=None, validation_alias="RAZORPAY_WEBHOOK_SECRET"
+    )
+    billing_pro_monthly_paise: int = Field(default=49900, validation_alias="BILLING_PRO_MONTHLY_PAISE")
+    billing_growth_monthly_paise: int = Field(
+        default=99900, validation_alias="BILLING_GROWTH_MONTHLY_PAISE"
+    )
+
     # ── Misc ──────────────────────────────────────────────────────────────────
     default_workspace_timezone: str = Field(
         default="Asia/Kolkata", validation_alias="DEFAULT_WORKSPACE_TIMEZONE"

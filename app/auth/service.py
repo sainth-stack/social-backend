@@ -83,22 +83,28 @@ def register_user(db: Database, payload: RegisterRequest) -> tuple[dict, dict, d
 
 
 def authenticate_user(db: Database, payload: LoginRequest) -> dict:
-    user = get_user_by_email(db, payload.email)
+    email = payload.email.lower().strip()
+    user = get_user_by_email(db, email)
     if not user:
+        logger.info("login failed: unknown email email=%s", email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password"
         )
     if not user.get("password_hash"):
+        logger.info("login failed: google-only account user_id=%s email=%s", user["id"], email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="This account uses Google sign-in. Continue with Google.",
         )
     if not verify_password(payload.password, user["password_hash"]):
+        logger.info("login failed: bad password user_id=%s email=%s", user["id"], email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password"
         )
     if not user.get("is_active"):
+        logger.warning("login blocked: suspended user_id=%s email=%s", user["id"], email)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is suspended")
+    logger.info("login success user_id=%s email=%s", user["id"], email)
     return user
 
 

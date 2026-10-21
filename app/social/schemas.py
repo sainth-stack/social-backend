@@ -239,6 +239,10 @@ class GeneratePostRequest(BaseModel):
     cta: Optional[str] = None
     includeHashtags: bool = True
     includeComment: bool = False
+    includeEmojis: bool = True
+    contentType: Optional[str] = Field(default=None, max_length=32)
+    length: Optional[str] = Field(default=None, max_length=16)
+    mediaNote: Optional[str] = Field(default=None, max_length=500)
     format: Optional[str] = Field(default="single", max_length=32)
 
 

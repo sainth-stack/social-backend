@@ -939,6 +939,17 @@ def delete_template(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.get("/dashboard/home")
+def dashboard_home(
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
+) -> dict:
+    from app.social.polish import SocialPolishService
+
+    return SocialPolishService(db).dashboard_home(workspace)
+
+
 @router.get("/dashboard/stats")
 def dashboard_stats(
     workspace: dict = Depends(require_workspace_access),

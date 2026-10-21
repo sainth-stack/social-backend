@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from urllib.parse import quote
 
 from typing import Optional
@@ -39,6 +40,8 @@ from app.core.database import get_db
 from app.core.mongo_utils import public_doc
 from app.core.rate_limit import enforce_rate_limit
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
@@ -71,7 +74,15 @@ def login(
     db: Database = Depends(get_db),
 ) -> TokenResponse:
     enforce_rate_limit(request, key_prefix="auth_login", limit=30, window_seconds=900)
-    user = authenticate_user(db, payload)
+    try:
+        user = authenticate_user(db, payload)
+    except HTTPException as exc:
+        logger.info(
+            "auth login rejected status=%s email=%s",
+            exc.status_code,
+            payload.email.lower().strip(),
+        )
+        raise
     token = issue_token_for_user(user)
     return TokenResponse(access_token=token)
 

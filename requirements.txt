@@ -4,6 +4,7 @@ uvicorn[standard]>=0.24.0
 # Database — MongoDB
 pymongo>=4.6.0
 dnspython>=2.4.0
+certifi>=2024.0.0
 
 pydantic-settings>=2.0.0
 email-validator>=2.0.0
@@ -30,6 +31,9 @@ Pillow>=10.0.0
 
 # Email — Resend (same as OpsBrain-Backend)
 resend>=2.0.0
+
+# Payments — Razorpay
+razorpay>=1.4.2
 
 # Tests
 pytest>=8.0.0

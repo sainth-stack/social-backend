@@ -474,7 +474,54 @@ class SocialPolishService:
 
     # ── Dashboard ─────────────────────────────────────────────────────────────
 
+    def dashboard_home(self, workspace: dict) -> dict:
+        """Single payload for the workspace home dashboard (one round-trip)."""
+        from app.core.database import get_database, mongo_retry_once
+
+        def _refresh_db() -> None:
+            self.db = get_database()
+
+        return mongo_retry_once(
+            self._dashboard_home_impl,
+            workspace,
+            refresh=_refresh_db,
+        )
+
+    def _dashboard_home_impl(self, workspace: dict) -> dict:
+        from app.social.schemas import SocialPostListParams, SocialPostStatus
+        from app.social.service import SocialMediaService
+
+        stats = self._dashboard_stats_impl(workspace)
+        activity = self._activity_impl(workspace, 10)
+        recommendations = self.recommendations(workspace)
+        posts_page = SocialMediaService(self.db).list_posts(
+            workspace,
+            SocialPostListParams(
+                status=SocialPostStatus.SCHEDULED,
+                page=1,
+                pageSize=4,
+            ),
+        )
+        return {
+            "stats": stats,
+            "activity": activity,
+            "recommendations": recommendations,
+            "scheduledPosts": posts_page.items,
+        }
+
     def dashboard_stats(self, workspace: dict) -> dict:
+        from app.core.database import get_database, mongo_retry_once
+
+        def _refresh_db() -> None:
+            self.db = get_database()
+
+        return mongo_retry_once(
+            self._dashboard_stats_impl,
+            workspace,
+            refresh=_refresh_db,
+        )
+
+    def _dashboard_stats_impl(self, workspace: dict) -> dict:
         accounts = list(
             self.db["social_accounts"].find(
                 {"workspace_id": workspace["id"], "is_active": True}
@@ -524,11 +571,25 @@ class SocialPolishService:
         }
 
     def activity(self, workspace: dict, limit: int = 10) -> list[dict]:
+        from app.core.database import get_database, mongo_retry_once
+
+        def _refresh_db() -> None:
+            self.db = get_database()
+
+        return mongo_retry_once(
+            self._activity_impl,
+            workspace,
+            limit,
+            refresh=_refresh_db,
+        )
+
+    def _activity_impl(self, workspace: dict, limit: int = 10) -> list[dict]:
+        fetch_limit = min(max(limit * 4, limit), 40)
         rows = list(
             self.db["social_audit_logs"]
             .find({"workspace_id": workspace["id"]})
             .sort("created_at", -1)
-            .limit(limit)
+            .limit(fetch_limit)
         )
         if rows:
             post_ids = [
@@ -541,7 +602,7 @@ class SocialPolishService:
                 for post in self.db["social_posts"].find({"id": {"$in": post_ids}}):
                     title_by_post_id[post["id"]] = post.get("title", "")
 
-            return [
+            items = [
                 self._serialize_activity_item(
                     id=str(r["id"]),
                     action=r.get("action", ""),
@@ -553,6 +614,9 @@ class SocialPolishService:
                 )
                 for r in rows
             ]
+            items = self._enrich_activity_items(items)
+            items = self._collapse_activity_duplicates(items)
+            return items[:limit]
 
         # Fallback: recent posts status changes
         posts = list(
@@ -561,7 +625,7 @@ class SocialPolishService:
             .sort("updated_at", -1)
             .limit(limit)
         )
-        return [
+        items = [
             self._serialize_activity_item(
                 id=str(p["id"]),
                 action=f"post.{p.get('status', 'draft')}",
@@ -572,11 +636,92 @@ class SocialPolishService:
             )
             for p in posts
         ]
+        return self._enrich_activity_items(items)
+
+    def _enrich_activity_items(self, items: list[dict]) -> list[dict]:
+        post_ids = list(
+            {
+                str(i["entityId"])
+                for i in items
+                if i.get("entityType") == "post" and i.get("entityId")
+            }
+        )
+        platforms_by_post: dict[str, list[str]] = {}
+        if post_ids:
+            for pp in self.db["social_post_platforms"].find({"post_id": {"$in": post_ids}}):
+                pid = str(pp.get("post_id") or "")
+                platform = (pp.get("platform") or "").strip()
+                if not pid or not platform:
+                    continue
+                bucket = platforms_by_post.setdefault(pid, [])
+                if platform not in bucket:
+                    bucket.append(platform)
+
+        for item in items:
+            meta = item.get("metadata") or {}
+            platforms: list[str] = []
+            meta_platform = meta.get("platform")
+            if isinstance(meta_platform, str) and meta_platform.strip():
+                platforms.append(meta_platform.strip())
+            entity_id = item.get("entityId")
+            if entity_id:
+                for p in platforms_by_post.get(str(entity_id), []):
+                    if p not in platforms:
+                        platforms.append(p)
+            item["platforms"] = platforms
+            item["groupCount"] = int(item.get("groupCount") or 1)
+        return items
+
+    @staticmethod
+    def _collapse_activity_duplicates(items: list[dict]) -> list[dict]:
+        if not items:
+            return []
+        collapsed: list[dict] = []
+        for item in items:
+            if collapsed and SocialPolishService._activities_mergeable(collapsed[-1], item):
+                SocialPolishService._merge_activity_item(collapsed[-1], item)
+                continue
+            collapsed.append(dict(item))
+        return collapsed
+
+    @staticmethod
+    def _activities_mergeable(a: dict, b: dict) -> bool:
+        if a.get("entityId") != b.get("entityId"):
+            return False
+        if a.get("action") != b.get("action"):
+            return False
+        if a.get("entityType") != b.get("entityType"):
+            return False
+        ta = a.get("createdAt")
+        tb = b.get("createdAt")
+        if not ta or not tb:
+            return (a.get("text") or "") == (b.get("text") or "")
+        try:
+            da = datetime.fromisoformat(str(ta).replace("Z", "+00:00"))
+            db = datetime.fromisoformat(str(tb).replace("Z", "+00:00"))
+            if da.tzinfo is None:
+                da = da.replace(tzinfo=timezone.utc)
+            if db.tzinfo is None:
+                db = db.replace(tzinfo=timezone.utc)
+            return abs((da - db).total_seconds()) <= 300
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _merge_activity_item(into: dict, other: dict) -> None:
+        into["groupCount"] = int(into.get("groupCount") or 1) + 1
+        merged = list(into.get("platforms") or [])
+        for p in other.get("platforms") or []:
+            if p not in merged:
+                merged.append(p)
+        into["platforms"] = merged
 
     @staticmethod
     def _activity_type(action: str) -> str:
         normalized = action.lower()
-        if any(k in normalized for k in ("publish", "failed")):
+        if "failed" in normalized:
+            return "failed"
+        if "publish" in normalized:
             return "published"
         if "schedule" in normalized or normalized.endswith(".scheduled"):
             return "scheduled"
@@ -641,6 +786,9 @@ class SocialPolishService:
         created_at: Optional[datetime],
         title_lookup: Optional[dict[str, str]] = None,
     ) -> dict:
+        title = (metadata.get("title") or metadata.get("name") or "").strip()
+        if not title and entity_type == "post" and entity_id and title_lookup:
+            title = (title_lookup.get(entity_id) or "").strip()
         return {
             "id": id,
             "action": action,
@@ -652,9 +800,12 @@ class SocialPolishService:
                 title_lookup=title_lookup,
                 entity_id=entity_id,
             ),
+            "title": title or None,
             "entityType": entity_type,
             "entityId": entity_id,
             "metadata": metadata,
+            "platforms": [],
+            "groupCount": 1,
             "createdAt": created_at.isoformat() if created_at else None,
         }
 

@@ -148,6 +148,20 @@ before** the underlying OpenAI call runs, in `app/social/limits.py`:
 All of these raise `402 Payment Required` with a structured `{code, message, limit, used}`
 body when a workspace is over quota or the feature isn't included in its plan.
 
+## Billing (Razorpay)
+
+Self-serve upgrades for **Pro (₹499/mo)** and **Growth (₹999/mo)** live under
+`app/billing/`:
+
+- `POST /api/v1/workspaces/{id}/billing/checkout` — Razorpay order (workspace admin)
+- `POST /api/v1/workspaces/{id}/billing/confirm` — signature verify + plan activation
+- `POST /api/v1/billing/webhooks/razorpay` — `payment.captured` / `order.paid` backup
+- Admin coupons: `GET/POST /api/v1/admin/coupons`, redemptions at
+  `GET /api/v1/admin/coupons/redemptions`
+
+Set `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and `RAZORPAY_WEBHOOK_SECRET` in `.env`
+(same keys as OpsBrain-Backend work if you reuse one Razorpay account).
+
 ## Known gaps / follow-ups
 
 - Video generation is disabled (`VIDEO_GENERATION_ENABLED=false`). Users can still upload

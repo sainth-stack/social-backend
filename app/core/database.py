@@ -1,20 +1,63 @@
 from __future__ import annotations
 
-from collections.abc import Generator
+import logging
+import threading
+import time
+from collections.abc import Callable, Generator
+from typing import Any, TypeVar
 
-from pymongo import MongoClient, ASCENDING, DESCENDING
+import certifi
+from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.database import Database
+from pymongo.errors import AutoReconnect, ConnectionFailure, NetworkTimeout, ServerSelectionTimeoutError
 
 from app.core.config import settings
 
+logger = logging.getLogger(__name__)
+
 _client: MongoClient | None = None
+_client_lock = threading.Lock()
+
+T = TypeVar("T")
+
+_MONGO_TRANSIENT = (
+    AutoReconnect,
+    ConnectionFailure,
+    NetworkTimeout,
+    ServerSelectionTimeoutError,
+)
+
+
+def _mongo_client_kwargs() -> dict[str, Any]:
+    return {
+        "serverSelectionTimeoutMS": 8000,
+        "connectTimeoutMS": 10000,
+        "socketTimeoutMS": 20000,
+        "retryReads": True,
+        "retryWrites": True,
+        "maxPoolSize": 50,
+        "tlsCAFile": certifi.where(),
+    }
+
+
+def reset_mongo_client() -> None:
+    """Drop the shared client so the next request opens fresh TLS connections."""
+    global _client
+    with _client_lock:
+        if _client is not None:
+            try:
+                _client.close()
+            except Exception as exc:  # noqa: BLE001 — best-effort close
+                logger.debug("MongoClient close: %s", exc)
+            _client = None
 
 
 def _get_client() -> MongoClient:
     global _client
-    if _client is None:
-        _client = MongoClient(settings.mongodb_url, serverSelectionTimeoutMS=10000)
-    return _client
+    with _client_lock:
+        if _client is None:
+            _client = MongoClient(settings.mongodb_url, **_mongo_client_kwargs())
+        return _client
 
 
 def get_database() -> Database:
@@ -22,8 +65,25 @@ def get_database() -> Database:
 
 
 def get_db() -> Generator[Database, None, None]:
-    db = get_database()
-    yield db
+    yield get_database()
+
+
+def mongo_retry_once(
+    func: Callable[..., T],
+    *args: Any,
+    refresh: Callable[[], None] | None = None,
+    **kwargs: Any,
+) -> T:
+    """Retry once on transient Atlas/network errors without closing the shared client."""
+    try:
+        return func(*args, **kwargs)
+    except _MONGO_TRANSIENT as exc:
+        logger.warning("MongoDB transient error (%s); resetting client and retrying once", exc)
+        reset_mongo_client()
+        if refresh is not None:
+            refresh()
+        time.sleep(0.25)
+        return func(*args, **kwargs)
 
 
 def init_db() -> None:
@@ -65,4 +125,14 @@ def _ensure_indexes(db: Database) -> None:
         [("workspace_id", ASCENDING), ("created_at", DESCENDING)]
     )
     db["plan_overrides"].create_index([("plan_key", ASCENDING)], unique=True)
+    db["billing_payments"].create_index([("workspace_id", ASCENDING), ("created_at", DESCENDING)])
+    db["billing_payments"].create_index([("provider_order_id", ASCENDING)], sparse=True)
+    db["billing_payments"].create_index([("id", ASCENDING)], unique=True)
+    db["billing_coupons"].create_index([("code", ASCENDING)], unique=True)
+    db["billing_coupon_redemptions"].create_index(
+        [("coupon_id", ASCENDING), ("created_at", DESCENDING)]
+    )
+    db["billing_coupon_redemptions"].create_index(
+        [("workspace_id", ASCENDING), ("created_at", DESCENDING)]
+    )
     print("[db] MongoDB indexes ensured")

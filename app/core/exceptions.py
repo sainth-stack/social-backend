@@ -7,6 +7,7 @@ import logging
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pymongo.errors import AutoReconnect, ConnectionFailure, NetworkTimeout, ServerSelectionTimeoutError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,25 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={"detail": exc.errors()},
+        )
+
+    @app.exception_handler(AutoReconnect)
+    @app.exception_handler(ConnectionFailure)
+    @app.exception_handler(NetworkTimeout)
+    @app.exception_handler(ServerSelectionTimeoutError)
+    async def mongo_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        from app.core.database import reset_mongo_client
+
+        logger.warning(
+            "MongoDB unavailable on %s %s: %s",
+            request.method,
+            request.url.path,
+            exc,
+        )
+        reset_mongo_client()
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "Database temporarily unavailable. Please retry."},
         )
 
     @app.exception_handler(Exception)

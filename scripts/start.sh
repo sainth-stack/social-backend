@@ -14,6 +14,13 @@ mkdir -p "$RUN_DIR"
 if [[ -f "$ROOT/.venv/bin/activate" ]]; then
   # shellcheck source=/dev/null
   source "$ROOT/.venv/bin/activate"
+  PY_VER="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+  if python -c 'import sys; exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    :
+  else
+    echo "Warning: Python $PY_VER in .venv — MongoDB Atlas TLS is unreliable below 3.11 on macOS." >&2
+    echo "  Recreate: rm -rf .venv && python3.11 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
+  fi
 elif [[ -f "$ROOT/venv/bin/activate" ]]; then
   # shellcheck source=/dev/null
   source "$ROOT/venv/bin/activate"
@@ -67,7 +74,23 @@ start_one() {
   fi
 }
 
+wait_for_api() {
+  local url="http://127.0.0.1:${PORT}/health"
+  local i=0
+  while [[ $i -lt 30 ]]; do
+    if curl -sf "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  echo "API process is up but /health did not respond — check $RUN_DIR/api.log" >&2
+  tail -30 "$RUN_DIR/api.log" >&2 || true
+  exit 1
+}
+
 start_one api uvicorn app.main:app --host 0.0.0.0 --port "$PORT" --reload
+wait_for_api
 start_one worker celery -A workers.celery_app:celery_app worker -l info \
   -Q social_publish,social_analytics,social_maintenance \
   -P "$CELERY_POOL" -n "worker@%h"
