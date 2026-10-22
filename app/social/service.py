@@ -22,6 +22,7 @@ from app.core.encryption import decrypt, encrypt
 from app.core.mongo_utils import new_id, utcnow
 from app.social.ai.generator import generate_brand_voice_sample, generate_platform_content
 from app.social.ai.image_generator import generate_post_image_from_url
+from app.social.ai.prompts import PLATFORM_LIMITS
 from app.social.models import (
     SocialImageSource,
     SocialMediaAssetType,
@@ -37,6 +38,7 @@ PUBLISHABLE_PLATFORMS = {
     SocialPlatform.X,
 }
 from app.social.oauth.base import OAuthAccountProfile, generate_state_token, get_oauth_handler
+from app.social.publishers.base import format_caption
 from app.social.schemas import (
     BrandLogoListResponse,
     BrandLogoOut,
@@ -636,6 +638,7 @@ class SocialMediaService:
                     socialAccountId=str(platform_row.get("social_account_id")) if platform_row.get("social_account_id") else None,
                     caption=caption,
                     hashtags=hashtags,
+                    firstComment=platform_row.get("first_comment"),
                 )
             ],
         }
@@ -1806,6 +1809,27 @@ class SocialMediaService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Connect at least one publishable account (Facebook, Instagram, LinkedIn, or X)",
             )
+        from app.social.ai.prompts import PLATFORM_LIMITS
+        from app.social.publishers.base import format_caption
+
+        for pp in publishable:
+            platform = pp["platform"]
+            text = format_caption(pp.get("caption") or "", pp.get("hashtags") or [])
+            limit = PLATFORM_LIMITS[platform]
+            if len(text) > limit:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"{platform} post is {len(text)} characters including hashtags; the limit is {limit}. Shorten it before publishing.",
+                )
+        for pp in publishable:
+            platform = pp["platform"]
+            character_count = len(format_caption(pp.get("caption") or "", pp.get("hashtags") or []))
+            limit = PLATFORM_LIMITS[platform]
+            if character_count > limit:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"{platform} content is {character_count} characters; the limit is {limit} (including hashtags and separators)",
+                )
         for pp in publishable:
             if not (pp.get("caption") or "").strip() and not post.get("image_url"):
                 raise HTTPException(

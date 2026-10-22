@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import colorsys
 import logging
+from math import gcd
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -112,9 +113,23 @@ def describe_color(value: Optional[str]) -> Optional[str]:
     return f"{tone} {name}"
 
 
-def _clean(text: Optional[str], limit: int) -> str:
+def _clean(text: Optional[str], limit: Optional[int] = None) -> str:
     value = " ".join((text or "").split())
     return value[:limit]
+
+
+def _composition(spec: CreativeSpec) -> str:
+    width, height = target_size(spec.format, spec.platform)
+    divisor = gcd(width, height)
+    orientation = "portrait" if height > width else "landscape" if width > height else "square"
+    frame = (
+        f"Compose for {spec.platform or 'social media'} {spec.format}, "
+        f"{width}x{height}, {width // divisor}:{height // divisor} {orientation} frame. "
+        "Keep the main subject legible at mobile feed size. "
+    )
+    if spec.text_overlay or spec.format == "quote":
+        return frame + _COMPOSITION.get(spec.format, _COMPOSITION["post"])
+    return frame + "Use the full frame for the visual; no reserved headline area or text panel."
 
 
 def _brand_lines(brand: dict) -> list[str]:
@@ -142,21 +157,22 @@ def _palette_phrase(brand: dict) -> str:
 
 
 def build_visual_prompt(subject: str, spec: CreativeSpec, brand: dict, style: Optional[str]) -> str:
+    brand = brand if spec.use_brand else {}
     parts = [
-        f"Scroll-stopping social media {'ad creative' if spec.format != 'quote' else 'background'} for {spec.platform or 'social media'}.",
-        f"Subject: {_clean(subject, 360)}.",
+        "Absolutely no text, letters, numbers, logos, watermarks or UI elements.",
+        "Brief and caption are primary: preserve their subject and constraints without inventing claims, products, offers or assets. "
+        "Brand guides tone and palette only.",
+        _composition(spec),
+        f"Subject: {_clean(subject)}.",
     ]
-    if brand.get("industry"):
-        parts.append(f"Context: {_clean(brand['industry'], 60)} brand.")
-    if brand.get("target_audience") and spec.format != "quote":
-        parts.append(f"Made for {_clean(brand['target_audience'], 90)}.")
-    parts.append(_COMPOSITION.get(spec.format, _COMPOSITION["post"]))
+    if spec.caption:
+        parts.append(f"Post caption (context only, not text to render): {_clean(spec.caption)}")
+    parts.extend(_brand_lines(brand))
     parts.append(f"Style: {_clean(style, 160) if style else _DEFAULT_STYLE}.")
     palette = _palette_phrase(brand)
     if palette:
         parts.append(palette)
-    parts.append("Absolutely no text, letters, numbers, logos, watermarks or UI elements.")
-    return " ".join(p for p in parts if p)[:1000]
+    return " ".join(p for p in parts if p)
 
 
 def _fallback_copy(topic: str, spec: CreativeSpec, brand: dict) -> OverlayCopy:
@@ -175,9 +191,11 @@ def _fallback_copy(topic: str, spec: CreativeSpec, brand: dict) -> OverlayCopy:
 def art_direct(topic: str, spec: CreativeSpec, brand: dict, style: Optional[str]) -> tuple[str, OverlayCopy]:
     from app.social.ai.generator import _chat_completion, _get_llm, _message_text, _parse_json_content
 
+    brand = brand if spec.use_brand else {}
     width, height = target_size(spec.format, spec.platform)
     language = brand.get("primary_language") or "en"
     is_quote = spec.format == "quote"
+    wants_copy = spec.text_overlay or is_quote
     headline_rule = (
         "headline: the quote itself, a memorable insight under 22 words, no quotation marks"
         if is_quote
@@ -188,25 +206,35 @@ def art_direct(topic: str, spec: CreativeSpec, brand: dict, style: Optional[str]
         slide_line = f"This is slide {spec.slide_index} of {spec.slide_count} in a carousel; keep a consistent series look."
     system_prompt = (
         "You are the creative director of a top digital agency. Turn a social media brief into a precise "
-        "text-to-image prompt and short on-image copy. Reply with JSON only: "
-        '{"visual":"...","headline":"...","subtext":"...","cta":"..."}. '
+        "text-to-image prompt. Reply with JSON only: "
+        + ('{"visual":"...","headline":"...","subtext":"...","cta":"..."}. ' if wants_copy else '{"visual":"..."}. ')
+        + "The original brief and post caption are the primary visual source: preserve the brief's subject and explicit "
+        "visual constraints, and reflect the caption's message. Brand context guides tone, audience and palette only. "
+        "Do not invent product features, results, statistics, offers, endorsements or brand assets. "
         "visual: 45-90 words describing one clear subject, setting, composition, lighting, lens or medium, mood and palette. "
         "Photorealistic commercial quality unless the brief implies illustration. "
         "Never request text, letters, numbers, logos, watermarks, UI or screenshots in the visual. "
-        f"Composition requirement: {_COMPOSITION.get(spec.format, _COMPOSITION['post'])} "
-        f"{headline_rule}. subtext: optional supporting line under 14 words or empty. "
-        "cta: 1-3 words only when the brief implies an action, else empty. "
-        f"No hashtags, emojis or quotation marks in copy. Copy language: {language}."
+        f"Composition requirement: {_composition(spec)} "
     )
+    if wants_copy:
+        system_prompt += (
+            f"{headline_rule}. subtext: optional supporting line under 14 words or empty. "
+            "cta: 1-3 words only when the brief implies an action, else empty. "
+            f"Preserve supplied manual copy. No hashtags, emojis or quotation marks in generated copy. Copy language: {language}."
+        )
+    else:
+        system_prompt += "Text overlays are disabled. Return only visual; do not generate headline, subtext or CTA copy."
     user_lines = [
-        f"Brief: {_clean(topic, 500)}",
+        f"Original brief: {_clean(topic)}",
         f"Format: {spec.format} ({width}x{height}) for {spec.platform or 'social media'}",
     ]
     if spec.caption:
-        user_lines.append(f"Post caption: {_clean(spec.caption, 600)}")
-    if spec.headline:
+        user_lines.append(f"Post caption: {_clean(spec.caption)}")
+    if wants_copy and spec.headline:
         user_lines.append(f"Preferred headline: {_clean(spec.headline, 120)}")
-    if spec.cta:
+    if wants_copy and spec.subtext:
+        user_lines.append(f"Supporting line: {_clean(spec.subtext, 140)}")
+    if wants_copy and spec.cta:
         user_lines.append(f"Call to action: {_clean(spec.cta, 40)}")
     if style:
         user_lines.append(f"Visual style: {_clean(style, 160)}")
@@ -228,7 +256,9 @@ def art_direct(topic: str, spec: CreativeSpec, brand: dict, style: Optional[str]
         max_completion_tokens=1500,
     )
     data: dict[str, Any] = _parse_json_content(_message_text(response.choices[0].message))
-    visual = _clean(str(data.get("visual") or ""), 700)
+    visual = _clean(str(data.get("visual") or ""))
+    if not wants_copy:
+        return visual, OverlayCopy()
     copy = OverlayCopy(
         headline=_clean(spec.headline or str(data.get("headline") or ""), 160 if is_quote else 80).strip("\"'“”"),
         subtext=_clean(spec.subtext or str(data.get("subtext") or ""), 140),
@@ -263,11 +293,9 @@ def render_creative(
     if wants_copy and not copy.headline:
         copy = _fallback_copy(topic, spec, brand)
 
-    subject = visual or (f"{topic}. Post context: {spec.caption}" if spec.caption else topic)
-    prompt = build_visual_prompt(subject, spec, brand, style) if not visual else (
-        f"{visual} {_COMPOSITION.get(fmt, '')} {_palette_phrase(brand)} "
-        "Absolutely no text, letters, numbers, logos, watermarks or UI elements."
-    ).strip()[:1000]
+    prompt = build_visual_prompt(f"Original brief: {topic}", spec, brand, style)
+    if visual:
+        prompt += f" Art direction (subordinate to the brief and caption): {visual}"
 
     data = generate_post_image(
         topic=topic,

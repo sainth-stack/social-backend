@@ -13,8 +13,11 @@ from fastapi import HTTPException, status
 from app.social.ai.caption_sanitize import sanitize_caption_and_hashtags
 from app.social.ai.prompts import (
     GENERIC_FILLER_PHRASES,
+    PLATFORM_HASHTAG_LIMITS,
     PLATFORM_LIMITS,
+    QUALITY_BAR,
     brief_fidelity_score,
+    build_brand_context,
     build_fidelity_revision_prompt,
     build_system_prompt,
     build_user_prompt,
@@ -22,6 +25,7 @@ from app.social.ai.prompts import (
     is_substantive_brief,
 )
 from app.social.models import SocialPlatform
+from app.social.publishers.base import format_caption
 
 logger = logging.getLogger(__name__)
 
@@ -80,27 +84,37 @@ def _parse_json_content(raw: str) -> dict[str, Any]:
 def _trim_caption(caption: str, limit: int) -> str:
     """Fit caption to limit without cutting mid-word when possible."""
     caption = (caption or "").strip()
+    if limit <= 0:
+        return ""
     if len(caption) <= limit:
         return caption
-    if limit <= 1:
-        return "…"
     window = caption[:limit]
-    for sep in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
-        idx = window.rfind(sep)
-        if idx >= max(40, limit // 3):
-            return window[: idx + 1].strip()
-    idx = window.rfind(" ")
-    if idx >= max(20, limit // 4):
+    endings = list(re.finditer(r"[.!?](?=\s|$)", window))
+    if endings and endings[-1].end() >= min(40, limit // 3):
+        return window[:endings[-1].end()].strip()
+    idx = window[:limit - 1].rfind(" ")
+    if idx > 0:
         return window[:idx].rstrip(" ,;:-") + "."
-    return window[: limit - 1].rstrip() + "…"
+    return window[:limit - 1].rstrip(" ,;:-") + "."
 
 
-def _caption_needs_polish(caption: str, platform_key: str) -> bool:
+def _fit_caption_and_hashtags(caption: str, hashtags: list[str], limit: int) -> tuple[str, list[str]]:
+    caption = _trim_caption(caption, limit)
+    fitted: list[str] = []
+    for tag in hashtags:
+        if len(format_caption(caption, [*fitted, tag])) <= limit:
+            fitted.append(tag)
+    return caption, fitted
+
+
+def _caption_needs_polish(caption: str, platform_key: str, length_hint: Optional[str] = None) -> bool:
     text = (caption or "").strip()
-    if len(text) < 40:
-        return True
     low = text.lower()
     if any(phrase in low for phrase in GENERIC_FILLER_PHRASES):
+        return True
+    if (length_hint or "").strip().lower() == "short":
+        return False
+    if len(text) < 40:
         return True
     if platform_key == SocialPlatform.X.value:
         return len(text) < 80
@@ -110,12 +124,14 @@ def _caption_needs_polish(caption: str, platform_key: str) -> bool:
 
 
 def _normalize_hashtags(raw: Any, limit: int) -> list[str]:
-    if not isinstance(raw, list):
+    if not isinstance(raw, list) or limit <= 0:
         return []
     tags: list[str] = []
+    seen: set[str] = set()
     for item in raw:
         tag = str(item).strip().lstrip("#")
-        if tag and tag not in tags:
+        if tag and tag.casefold() not in seen:
+            seen.add(tag.casefold())
             tags.append(tag)
         if len(tags) >= limit:
             break
@@ -242,28 +258,20 @@ def _complete_json(
     finish_reason = getattr(choice, "finish_reason", None)
     refusal = getattr(message, "refusal", None)
 
-    # Reasoning models often burn the whole budget on thinking (finish_reason=length,
-    # empty content). Retry once with a minimal prompt and a larger budget.
     if not raw and finish_reason == "length":
         logger.warning(
             "Social generate empty+length for %s; retrying with larger budget",
             platform_key,
         )
-        limit = PLATFORM_LIMITS.get(platform_key, 2200)
         retry_messages = [
             {
                 "role": "system",
-                "content": (
-                    "You write social posts. Reply with JSON only: "
-                    '{"caption":"...","hashtags":["tag"],"first_comment":""}. '
-                    f"caption must be a complete sentence under {limit} characters. "
-                    "No markdown. No ellipsis mid-sentence."
-                ),
+                "content": system_prompt,
             },
             {
                 "role": "user",
                 "content": (
-                    f"Write a short {platform_key} post from this brief:\n{user_prompt}"
+                    f"{user_prompt}\nReturn the requested JSON directly, without extra explanation."
                 ),
             },
         ]
@@ -273,6 +281,7 @@ def _complete_json(
             messages=retry_messages,
             max_completion_tokens=_RETRY_COMPLETION_TOKENS,
             reasoning_effort="low",
+            temperature=temperature,
         )
         choice = response.choices[0]
         message = choice.message
@@ -318,9 +327,7 @@ def _generate_one_platform(
     media_note: Optional[str] = None,
 ) -> tuple[str, dict[str, Any]]:
     limit = PLATFORM_LIMITS.get(platform_key, 2200)
-    hashtag_limit = 30 if platform_key == SocialPlatform.INSTAGRAM.value else 5
-    if platform_key == SocialPlatform.X.value:
-        hashtag_limit = 2
+    hashtag_limit = PLATFORM_HASHTAG_LIMITS.get(platform_key, 5)
     caption_budget = limit
     if include_hashtags and platform_key == SocialPlatform.X.value:
         caption_budget = max(120, limit - 36)
@@ -391,14 +398,11 @@ def _generate_one_platform(
         hashtags,
         hashtag_limit=hashtag_limit if include_hashtags else 0,
     )
-    tags_text = ""
-    if hashtags:
-        tags_text = " " + " ".join(f"#{t}" for t in hashtags)
-    caption = _trim_caption(caption_raw, max(1, limit - len(tags_text)))
+    caption, hashtags = _fit_caption_and_hashtags(caption_raw, hashtags, limit)
 
     fidelity_low = substantive and brief_fidelity_score(topic, caption) < 0.22
     needs_polish = caption and (
-        _caption_needs_polish(caption, platform_key) or fidelity_low
+        _caption_needs_polish(caption, platform_key, length_hint) or fidelity_low
     )
     if needs_polish:
         reason = "low brief fidelity" if fidelity_low else "weak first draft"
@@ -409,7 +413,7 @@ def _generate_one_platform(
             if t.lower() not in (caption or "").lower()
         ]
         polish_user = build_fidelity_revision_prompt(user_prompt, missing)
-        if series_mode and not fidelity_low:
+        if series_mode and not fidelity_low and (length_hint or "").strip().lower() != "short":
             polish_user += (
                 "\nAlso aim for ~350–900 characters on Instagram/Facebook when limit allows."
             )
@@ -425,21 +429,18 @@ def _generate_one_platform(
                 hashtags2,
                 hashtag_limit=hashtag_limit if include_hashtags else 0,
             )
-            tags_text2 = ""
-            if hashtags2:
-                tags_text2 = " " + " ".join(f"#{t}" for t in hashtags2)
-            caption2 = _trim_caption(cap2, max(1, limit - len(tags_text2)))
+            caption2, hashtags2 = _fit_caption_and_hashtags(cap2, hashtags2, limit)
             score2 = brief_fidelity_score(topic, caption2)
             better = caption2 and (
-                (fidelity_low and score2 >= 0.22)
-                or (not fidelity_low and not _caption_needs_polish(caption2, platform_key))
+                (fidelity_low and score2 > brief_fidelity_score(topic, caption))
+                or (not fidelity_low and not _caption_needs_polish(caption2, platform_key, length_hint))
             )
             if better:
                 caption = caption2
                 hashtags = hashtags2
                 first_comment = fc2.strip() if include_comment else first_comment
         except Exception:
-            pass
+            logger.warning("Social generate polish failed for %s; retaining original draft", platform_key, exc_info=True)
 
     if not caption:
         logger.error(
@@ -455,9 +456,7 @@ def _generate_one_platform(
             ),
         )
 
-    full_text = caption
-    if hashtags:
-        full_text = f"{caption} " + " ".join(f"#{t}" for t in hashtags)
+    full_text = format_caption(caption, hashtags)
     return platform_key, {
         "caption": caption,
         "hashtags": hashtags,
@@ -640,9 +639,11 @@ def generate_carousel_content(
     cta_note = f"\nCall to action: {cta}." if cta else ""
 
     system_prompt = (
-        "You are an elite social content strategist who designs carousels that "
-        "educate, build trust, and drive demos/signups/revenue. "
-        "Elevate short or vague briefs into premium, specific slides — no generic AI fluff. "
+        f"{QUALITY_BAR}\n{build_brand_context(brand_voice, SocialPlatform.LINKEDIN.value)}\n"
+        "Design an educational LinkedIn/Instagram carousel with one useful idea per slide. "
+        "Use an intro hook and a logical slide narrative grounded in the brief. "
+        "Use at most one CTA across the caption and slides, on the final slide if appropriate. "
+        f"Use up to {PLATFORM_HASHTAG_LIMITS[SocialPlatform.LINKEDIN.value]} relevant hashtags, not a quota. "
         "Return ONLY a JSON object with no extra text.\n"
         "Schema:\n"
         '{"caption":"<intro caption, max 300 chars>",'
@@ -659,7 +660,7 @@ def generate_carousel_content(
         f"Rules:\n"
         f"- Slide 1: scroll-stopping hook / painful problem\n"
         f"- Slides 2-{num_slides - 1}: one concrete insight, tip, or step (specific, useful)\n"
-        f"- Last slide: clear revenue CTA (book demo, try, buy, comment)\n"
+        f"- Last slide: one natural next step aligned with the brief; no forced sales CTA\n"
         f"- Headlines must be punchy; body must sound human and expert\n"
         f"- imagePrompt: cinematic, commercial, photorealistic, no text overlays\n"
         f"Return exactly {num_slides} slides."
@@ -689,8 +690,14 @@ def generate_carousel_content(
     while len(slides) < 2:
         slides.append({"headline": f"Slide {len(slides) + 1}", "body": "", "imagePrompt": topic})
 
-    hashtags = _normalize_hashtags(parsed.get("hashtags") or [], 10)
-    caption = str(parsed.get("caption") or topic)
+    hashtag_limit = PLATFORM_HASHTAG_LIMITS[SocialPlatform.LINKEDIN.value]
+    hashtags = _normalize_hashtags(parsed.get("hashtags") or [], hashtag_limit)
+    caption, hashtags = sanitize_caption_and_hashtags(
+        str(parsed.get("caption") or topic), hashtags, hashtag_limit=hashtag_limit,
+    )
+    caption, hashtags = _fit_caption_and_hashtags(
+        _trim_caption(caption, 300), hashtags, PLATFORM_LIMITS[SocialPlatform.INSTAGRAM.value],
+    )
 
     return {"slides": slides, "caption": caption, "hashtags": hashtags}
 
@@ -719,8 +726,12 @@ def generate_thread_content(
     cta_note = f"\nThread CTA (last tweet): {cta}." if cta else ""
 
     system_prompt = (
-        "You are a viral X/Twitter thread writer who turns thin ideas into "
-        "high-signal threads that get saves, follows, and conversions. "
+        f"{QUALITY_BAR}\n{build_brand_context(brand_voice, SocialPlatform.X.value)}\n"
+        "Write a connected X thread: one clear idea per tweet with a logical progression. "
+        "Use only one CTA, in the last tweet, if appropriate to the brief. "
+        "Each tweet including numbering must fit 270 characters; the last tweet plus "
+        "hashtags and the two-newline separator must fit 280 characters. "
+        f"Use up to {PLATFORM_HASHTAG_LIMITS[SocialPlatform.X.value]} relevant hashtags in the array only. "
         "No empty hype. Return ONLY a JSON object.\n"
         'Schema: {"tweets":[{"text":"<tweet text, max 270 chars>"}],"hashtags":["tag1","tag2"]}'
     )
@@ -729,10 +740,10 @@ def generate_thread_content(
         f"Write a {num_tweets}-tweet thread from this brief.\n"
         f"Tone: {tone}.{brand_note}{audience_note}{cta_note}\n"
         "Rules:\n"
-        "- Tweet 1: arresting hook (specific pain, bold claim, or curiosity gap)\n"
+        "- Tweet 1: specific hook grounded in provided facts, without clickbait\n"
         "- Middle tweets: one clear, useful point each, numbered (2/, 3/ etc.)\n"
-        "- Last tweet: strong CTA that can generate revenue or leads\n"
-        "- Elevate a short brief into an impressive expert thread\n"
+        "- Last tweet: one natural next step aligned with the brief, not a forced sales CTA\n"
+        "- Expand only for clarity; do not invent supporting claims\n"
         f"- Each tweet MUST be under 270 characters\n"
         f"Return exactly {num_tweets} tweets."
     )
@@ -754,12 +765,16 @@ def generate_thread_content(
         else:
             text = str(t).strip()
         if text:
-            tweets.append({"text": text})
+            text, _ = sanitize_caption_and_hashtags(text, [], hashtag_limit=0)
+            tweets.append({"text": _trim_caption(text, 270)})
 
     while len(tweets) < 2:
         tweets.append({"text": ""})
 
-    hashtags = _normalize_hashtags(parsed.get("hashtags") or [], 5)
+    hashtags = _normalize_hashtags(parsed.get("hashtags") or [], PLATFORM_HASHTAG_LIMITS[SocialPlatform.X.value])
+    tweets[-1]["text"], hashtags = _fit_caption_and_hashtags(
+        tweets[-1]["text"], hashtags, PLATFORM_LIMITS[SocialPlatform.X.value],
+    )
     return {"tweets": tweets, "hashtags": hashtags}
 
 
@@ -784,8 +799,11 @@ def generate_poll_content(
     audience_note = f"\nTarget audience: {audience}." if audience else ""
 
     system_prompt = (
-        "You are a social media engagement expert who designs polls that "
-        "surface buying intent and start revenue conversations. "
+        f"{QUALITY_BAR}\n{build_brand_context(brand_voice, SocialPlatform.LINKEDIN.value)}\n"
+        "Design a relevant, neutral poll with balanced, mutually exclusive options. "
+        "Avoid loaded questions, assumed audience traits, and manufactured controversy. "
+        "Voting is the single CTA; do not add a competing sales request. "
+        f"Use up to {PLATFORM_HASHTAG_LIMITS[SocialPlatform.LINKEDIN.value]} relevant hashtags, not a quota. "
         "Return ONLY a JSON object.\n"
         'Schema: {"question":"<poll question, max 140 chars>","options":["<opt1>","<opt2>","<opt3>","<opt4>"],'
         '"caption":"<intro text to post above poll, max 300 chars>","hashtags":["tag1","tag2"]}'
@@ -795,10 +813,10 @@ def generate_poll_content(
         f"Create an engaging poll from this brief.\n"
         f"Tone: {tone}.{brand_note}{audience_note}\n"
         "Rules:\n"
-        "- Question must spark debate or reveal a buying preference\n"
+        "- Question must invite useful feedback relevant to the brief, without leading voters\n"
         "- Options: mutually exclusive, no 'other' catch-all, max 25 chars each\n"
-        "- Caption: professional, benefit-led reason to vote + soft CTA\n"
-        "- Elevate a short brief into something impressive\n"
+        "- Caption: a clear reason to vote; voting is the only CTA\n"
+        "- Expand only for clarity using provided facts\n"
         "- Return exactly 4 options."
     )
 
@@ -813,12 +831,21 @@ def generate_poll_content(
 
     options_raw = parsed.get("options") or []
     options = [str(o)[:25] for o in options_raw if o][:4]
-    while len(options) < 2:
+    while len(options) < 4:
         options.append(f"Option {len(options) + 1}")
 
+    hashtag_limit = PLATFORM_HASHTAG_LIMITS[SocialPlatform.LINKEDIN.value]
+    caption, hashtags = sanitize_caption_and_hashtags(
+        str(parsed.get("caption") or ""),
+        _normalize_hashtags(parsed.get("hashtags") or [], hashtag_limit),
+        hashtag_limit=hashtag_limit,
+    )
+    caption, hashtags = _fit_caption_and_hashtags(
+        _trim_caption(caption, 300), hashtags, PLATFORM_LIMITS[SocialPlatform.LINKEDIN.value],
+    )
     return {
-        "question": str(parsed.get("question") or topic)[:140],
+        "question": _trim_caption(str(parsed.get("question") or topic), 140),
         "options": options,
-        "caption": str(parsed.get("caption") or ""),
-        "hashtags": _normalize_hashtags(parsed.get("hashtags") or [], 8),
+        "caption": caption,
+        "hashtags": hashtags,
     }

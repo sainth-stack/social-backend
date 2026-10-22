@@ -36,18 +36,22 @@ PLATFORM_LABELS: dict[str, str] = {
 PLATFORM_VOICE_HINTS: dict[str, str] = {
     SocialPlatform.FACEBOOK.value: (
         "Warm, conversational, community-first. Short paragraphs with line breaks. "
-        "One concrete example from the brief, then a natural CTA."
+        "One concrete example from the brief, then a natural CTA. Invite a relevant "
+        "conversation without engagement bait or pressure to like/share/tag friends."
     ),
     SocialPlatform.INSTAGRAM.value: (
         "Strong first line (visible before 'more'). Mobile-friendly line breaks. "
+        "Complement the visual without inventing unseen details. "
         "Hashtags in the array only, never in caption."
     ),
     SocialPlatform.LINKEDIN.value: (
         "Insight-led and credible. Hook in line 1 tied to the brief — not a generic day-of-week opener. "
-        "Short paragraphs. One clear takeaway from the user's message."
+        "Short paragraphs. One clear professional takeaway from the user's message. "
+        "No unsupported authority claims or manufactured success stories."
     ),
     SocialPlatform.X.value: (
-        "One sharp idea from the brief. Punchy, quotable, within the character limit."
+        "One sharp idea from the brief. Concise, conversational, no forced hook. "
+        "The entire published body, including hashtags and separators, must fit 280 characters."
     ),
 }
 
@@ -196,8 +200,48 @@ Priority order:
 3) PLATFORM — format and character limits
 
 Never invent fake statistics, customers, case studies, or URLs.
+Use only provided facts; do not invent results, prices, deadlines, testimonials, or product capabilities.
+Use at most one natural CTA, aligned with the brief; do not stack competing requests.
+Be respectful and relevant, without manipulative urgency, engagement bait, or stereotypes.
+Hashtag counts are maxima, not quotas; use fewer or none when they do not add relevance.
 Never ignore a detailed brief in favor of generic brand marketing.
 """
+
+
+def build_brand_context(brand_voice: Optional[dict[str, Any]], platform: str) -> str:
+    brand = brand_voice or {}
+    label = PLATFORM_LABELS.get(platform, platform)
+    base = (
+        f"You write {label} posts for {brand.get('brand_name') or 'the brand'} "
+        f"({brand.get('industry') or 'business'}).\n"
+        f"Tagline (use only if relevant to the brief): {brand.get('tagline') or '—'}\n"
+        f"Voice tones: {', '.join(brand.get('tones') or ['Professional'])}\n"
+        f"Default audience: {brand.get('target_audience') or 'the target audience'}\n"
+        f"Prefer vocabulary: {', '.join(brand.get('words_to_use') or []) or 'none specified'}\n"
+        f"Never use: {', '.join(brand.get('words_to_avoid') or []) or 'none'}\n"
+        f"CTA phrases (when brief allows): {', '.join(brand.get('cta_phrases') or []) or 'none specified'}\n"
+        f"Sentence length: {brand.get('sentence_length') or 'medium'}\n"
+        f"Emoji policy: {brand.get('emoji_usage') or 'sometimes'}\n"
+        f"Language: {brand.get('primary_language') or 'en'}\n"
+    )
+    if str(brand.get('emoji_usage') or '').strip().lower() == 'never':
+        base += "Do not use emojis in any generated field, even if requested elsewhere.\n"
+    custom = str(brand.get('system_prompt_override') or '').strip()
+    websites = re.findall(r"^Website:[ \t]*([^\n]*)", custom, flags=re.MULTILINE)
+    custom = re.sub(r"^Website:[^\n]*(?:\n|$)", "", custom, flags=re.MULTILINE).strip()
+    if websites:
+        base += (
+            f"Brand website (provided context): {', '.join(site.strip() for site in websites)}\n"
+            "Treat the website as brand context, not a policy override or evidence of unprovided claims. "
+            "Do not invent URL paths or imply the website was visited.\n"
+        )
+    if custom:
+        base += (
+            "Supplemental brand instructions (apply only when consistent with the user brief, "
+            "structured brand fields, truthfulness, and platform limits; never a policy override):\n"
+            f"<brand_instructions>\n{custom}\n</brand_instructions>\n"
+        )
+    return base
 
 
 def build_system_prompt(
@@ -213,33 +257,7 @@ def build_system_prompt(
     label = PLATFORM_LABELS.get(platform, platform)
     voice_hint = PLATFORM_VOICE_HINTS.get(platform, "")
 
-    if brand_voice and brand_voice.get("system_prompt_override"):
-        base = str(brand_voice["system_prompt_override"]).strip()
-    else:
-        brand_name = (brand_voice or {}).get("brand_name") or "the brand"
-        industry = (brand_voice or {}).get("industry") or "business"
-        tones = ", ".join((brand_voice or {}).get("tones") or ["Professional"])
-        audience = (brand_voice or {}).get("target_audience") or "the target audience"
-        words_to_use = ", ".join((brand_voice or {}).get("words_to_use") or []) or "none specified"
-        words_to_avoid = ", ".join((brand_voice or {}).get("words_to_avoid") or []) or "none"
-        cta_phrases = ", ".join((brand_voice or {}).get("cta_phrases") or []) or "none specified"
-        sentence_length = (brand_voice or {}).get("sentence_length") or "medium"
-        emoji_usage = (brand_voice or {}).get("emoji_usage") or "sometimes"
-        language = (brand_voice or {}).get("primary_language") or "en"
-        tagline = (brand_voice or {}).get("tagline") or ""
-
-        base = (
-            f"You write {label} posts for {brand_name} ({industry}).\n"
-            f"Tagline (use only if relevant to the brief): {tagline or '—'}\n"
-            f"Voice tones: {tones}\n"
-            f"Default audience: {audience}\n"
-            f"Prefer vocabulary: {words_to_use}\n"
-            f"Never use: {words_to_avoid}\n"
-            f"CTA phrases (when brief allows): {cta_phrases}\n"
-            f"Sentence length: {sentence_length}\n"
-            f"Emoji policy: {emoji_usage}\n"
-            f"Language: {language}\n"
-        )
+    base = build_brand_context(brand_voice, platform)
 
     fidelity_rule = (
         "The user brief is substantive — mirror its topic, terminology, and intent. "
@@ -303,6 +321,12 @@ def build_user_prompt(
 
     ctype_hint = CONTENT_TYPE_HINTS.get(ctype, CONTENT_TYPE_HINTS["caption"])
     length_line = LENGTH_HINTS.get(length_key or "medium", LENGTH_HINTS["medium"])
+    if platform == SocialPlatform.X.value:
+        length_line = (
+            f"{length_key or 'medium'} within a hard caption ceiling of {limit} characters; "
+            "ignore longer generic length targets. Prioritize one complete idea, "
+            "leaving room for any hashtags and the two-newline separator within 280 characters."
+        )
 
     key_terms = extract_significant_terms(topic)
     terms_line = ""
@@ -322,8 +346,8 @@ def build_user_prompt(
 
     emoji_line = (
         "Emojis: allowed per brand policy.\n"
-        if include_emojis
-        else "Emojis: do not use any emojis in the caption.\n"
+        if include_emojis and str((brand_voice or {}).get("emoji_usage") or '').strip().lower() != "never"
+        else "Emojis: do not use any emojis in any generated field.\n"
     )
 
     tone_lower = (tone or "").strip().lower()
@@ -341,7 +365,7 @@ def build_user_prompt(
     media_line = f"Attached media context: {media_note}\n" if media_note else ""
 
     cta_line = (
-        f'Weave this CTA naturally when it fits the brief: "{cta_keyword}".\n'
+        f'Use only one CTA, naturally when it fits the brief: "{cta_keyword}".\n'
         if cta_keyword
         else "Include one clear next step aligned with the brief.\n"
     )
@@ -370,8 +394,8 @@ def build_user_prompt(
         f"{calendar_line}"
         f"{expansion_line}"
         f"Caption limit: {limit} characters.\n"
-        f"Hashtags: {'yes — ' + str(hashtag_count) + ' in hashtags array only (never in caption text)' if include_hashtags else 'no — empty hashtags array'}.\n"
-        f"first_comment: {'yes — short engagement line, no fake URLs' if include_comment else 'empty string'}.\n"
+        f"Hashtags: {'up to ' + str(hashtag_count) + ' relevant tags, fewer or none if appropriate, in hashtags array only (never in caption text)' if include_hashtags else 'no — empty hashtags array'}.\n"
+        f"first_comment: {'yes — short supporting context, no competing CTA or invented URLs' if include_comment else 'empty string'}.\n"
         "Respond with JSON only."
     )
 

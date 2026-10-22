@@ -10,10 +10,12 @@ from fastapi import HTTPException, status
 
 from app.core.config import settings
 from app.providers.llm.bedrock_image import (
+    DEFAULT_IMAGE_MODEL_ID,
     generate_image_variation,
     generate_text_to_image,
     image_generation_configured,
 )
+from app.providers.llm.model_selection import current_models, image_region
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,7 @@ def generate_post_image(
             detail="Source image is required to refine an existing image",
         )
 
-    model_id = settings.bedrock_image_model_id or "amazon.nova-canvas-v1:0"
+    model_id = current_models().image or settings.bedrock_image_model_id or DEFAULT_IMAGE_MODEL_ID
     quality = settings.bedrock_image_quality or "premium"
 
     try:
@@ -116,7 +118,7 @@ def generate_post_image(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
                 f"Image {action} failed (model={model_id}). Enable the model in Bedrock "
-                f"({settings.resolved_bedrock_region}) or upload an image instead."
+                f"({image_region(model_id)}) or upload an image instead."
             ),
         ) from exc
 

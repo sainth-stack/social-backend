@@ -25,6 +25,12 @@ from pymongo.database import Database
 
 from app.auth.deps import get_current_user
 from app.core.database import get_db
+from app.providers.llm.model_selection import (
+    ModelSelection,
+    get_model_catalog,
+    selected_models,
+    validate_model_selection,
+)
 from app.workspaces.deps import require_workspace_access
 from app.social.dashboard_cache import invalidate_dashboard
 from app.social.dependencies import get_social_account_or_404, get_social_post_or_404
@@ -630,8 +636,18 @@ def test_brand_voice(
     workspace: dict = Depends(require_workspace_access),
     db: Database = Depends(get_db),
     _: dict = Depends(get_current_user),
+    models: ModelSelection = Depends(validate_model_selection),
 ) -> BrandVoiceTestResponse:
-    return SocialMediaService(db).test_brand_voice(workspace, payload)
+    with selected_models(models):
+        return SocialMediaService(db).test_brand_voice(workspace, payload)
+
+
+@router.get("/ai-models")
+def list_ai_models(
+    workspace: dict = Depends(require_workspace_access),
+    _: dict = Depends(get_current_user),
+) -> dict:
+    return get_model_catalog()
 
 
 @router.post("/generate", response_model=GeneratePostResponse)
@@ -640,8 +656,10 @@ def generate_post(
     workspace: dict = Depends(require_workspace_access),
     db: Database = Depends(get_db),
     user: dict = Depends(get_current_user),
+    models: ModelSelection = Depends(validate_model_selection),
 ) -> GeneratePostResponse:
-    return SocialMediaService(db).generate_post(workspace, payload, user)
+    with selected_models(models):
+        return SocialMediaService(db).generate_post(workspace, payload, user)
 
 
 @router.post("/generate-image", response_model=GenerateImageResponse)
@@ -650,6 +668,7 @@ def generate_image(
     workspace: dict = Depends(require_workspace_access),
     db: Database = Depends(get_db),
     user: dict = Depends(get_current_user),
+    models: ModelSelection = Depends(validate_model_selection),
 ) -> GenerateImageResponse:
     from app.social.ai.creative import CreativeSpec
 
@@ -671,16 +690,17 @@ def generate_image(
             slide_index=payload.slideIndex,
             slide_count=payload.slideCount,
         )
-    return SocialMediaService(db).generate_image(
-        workspace,
-        user,
-        payload.topic,
-        payload.style,
-        payload.size,
-        mode=payload.mode,  # type: ignore[arg-type]
-        source_image_url=payload.sourceImageUrl,
-        creative=creative,
-    )
+    with selected_models(models):
+        return SocialMediaService(db).generate_image(
+            workspace,
+            user,
+            payload.topic,
+            payload.style,
+            payload.size,
+            mode=payload.mode,
+            source_image_url=payload.sourceImageUrl,
+            creative=creative,
+        )
 
 
 @router.post("/upload-logo", response_model=UploadLogoResponse)

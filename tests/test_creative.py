@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import base64
+import json
 from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from PIL import Image
 
 from app.core.config import settings
 from app.social.ai.compositor import OverlayCopy, compose_creative
-from app.social.ai.creative import generation_size, target_size
+from app.social.ai.creative import CreativeSpec, art_direct, build_visual_prompt, generation_size, render_creative, target_size
 
 API = settings.api_v1_prefix
 
@@ -44,6 +48,174 @@ def test_target_and_generation_sizes():
     assert target_size("story", None) == (1080, 1920)
     w, h = (int(v) for v in generation_size(1080, 1920).split("x"))
     assert w % 16 == 0 and h % 16 == 0 and max(w, h) == 1280
+
+
+@pytest.fixture
+def art_direction_response(monkeypatch):
+    from app.social.ai import generator
+
+    message = SimpleNamespace(content=json.dumps({
+        "visual": "A gardener tending seedlings in warm morning light.",
+        "headline": "Generated headline",
+        "subtext": "Generated supporting line",
+        "cta": "Learn more",
+    }))
+    completion = Mock(return_value=SimpleNamespace(choices=[SimpleNamespace(message=message)]))
+    monkeypatch.setattr(generator, "_get_llm", lambda: (object(), "test-text-model"))
+    monkeypatch.setattr(generator, "_chat_completion", completion)
+    return completion
+
+
+def test_art_direct_grounded_in_full_brief_caption_brand_and_size(art_direction_response):
+    topic = "A community garden. " * 35 + "Only show seedlings, no mature trees."
+    caption = "Our neighborhood grows together. " * 25 + "Volunteers plant herbs this Saturday."
+    spec = CreativeSpec(platform="instagram", caption=caption, text_overlay=True)
+    visual, copy = art_direct(topic, spec, {
+        "brand_name": "Green Neighbors", "industry": "Community gardening",
+        "target_audience": "Local volunteers", "tones": ["Warm"],
+        "primary_color": "#0f766e", "accent_color": "#f59e0b",
+    }, "watercolor")
+    messages = art_direction_response.call_args.kwargs["messages"]
+    system, user = [message["content"] for message in messages]
+    assert topic in user and caption in user
+    assert "Green Neighbors" in user and "Local volunteers" in user and "Warm" in user
+    assert "teal" in user and "orange" in user and "watercolor" in user
+    assert "1080x1350" in user and "instagram" in user
+    assert "4:5 portrait" in system
+    assert "primary visual source" in system and "Do not invent" in system
+    assert "UI or screenshots" in system
+    assert "seedlings" in visual and copy.headline == "Generated headline"
+
+
+def test_art_direct_manual_copy_wins(art_direction_response):
+    spec = CreativeSpec(text_overlay=True, headline="Plant with us", subtext="Saturday in the garden", cta="Join us")
+    _, copy = art_direct("Community gardening", spec, {}, None)
+    assert copy == OverlayCopy(headline=spec.headline, subtext=spec.subtext, cta=spec.cta)
+    prompt = art_direction_response.call_args.kwargs["messages"][1]["content"]
+    assert spec.headline in prompt and spec.subtext in prompt and spec.cta in prompt
+
+
+def test_art_direct_no_overlay_copy_when_disabled(art_direction_response):
+    spec = CreativeSpec(headline="Hidden manual headline", subtext="Hidden subtext", cta="Hidden CTA")
+    _, copy = art_direct("Community gardening", spec, {}, None)
+    system, user = [message["content"] for message in art_direction_response.call_args.kwargs["messages"]]
+    assert '{"visual":"..."}' in system
+    assert "Text overlays are disabled" in system
+    assert "lower third" not in system and "upper two-thirds" not in system
+    assert spec.headline not in user and spec.subtext not in user and spec.cta not in user
+    assert copy == OverlayCopy()
+
+
+@pytest.mark.parametrize("platform,fmt,frame", [
+    ("instagram", "post", "4:5 portrait"),
+    ("linkedin", "post", "1:1 square"),
+    ("twitter", "post", "16:9 landscape"),
+    ("pinterest", "post", "2:3 portrait"),
+    ("instagram", "story", "9:16 portrait"),
+    ("linkedin", "carousel", "1:1 square"),
+])
+def test_visual_prompt_composition_matches_target_without_overlay(platform, fmt, frame):
+    spec = CreativeSpec(platform=platform, format=fmt)
+    prompt = build_visual_prompt("Garden volunteers", spec, {}, None)
+    width, height = target_size(fmt, platform)
+    assert f"{width}x{height}" in prompt and frame in prompt
+    assert "lower third" not in prompt and "upper two-thirds" not in prompt
+    assert "no reserved headline area" in prompt
+
+
+def test_visual_prompt_reserves_overlay_space_only_when_enabled():
+    prompt = build_visual_prompt("Garden volunteers", CreativeSpec(text_overlay=True), {}, None)
+    assert "calm uncluttered lower third" in prompt
+
+
+@pytest.mark.parametrize("directed", [False, True])
+def test_render_preserves_full_brief_caption_and_safety_rules(monkeypatch, directed):
+    from app.social.ai import creative
+
+    topic = "A gardener among seedlings. " * 25 + "Only show green seedlings."
+    caption = "We grow as a community. " * 30 + "Plant herbs with neighbors this Saturday."
+    visual = "Morning light on young plants. " * 30 + "Keep the watering can visible."
+    if directed:
+        monkeypatch.setattr(creative, "art_direct", lambda *args: (visual, OverlayCopy()))
+    else:
+        monkeypatch.setattr(creative, "art_direct", Mock(side_effect=RuntimeError("offline")))
+    generate = Mock(return_value={"imageB64": _png()})
+    compose = Mock(return_value=b"composed")
+    monkeypatch.setattr(creative, "generate_post_image", generate)
+    monkeypatch.setattr(creative, "compose_creative", compose)
+    result = render_creative(topic=topic, style=None, spec=CreativeSpec(caption=caption), brand={})
+    prompt = generate.call_args.kwargs["prompt_override"]
+    assert topic in prompt and caption in prompt
+    assert "Absolutely no text, letters, numbers, logos, watermarks or UI elements." in prompt
+    assert "without inventing claims" in prompt
+    assert result.prompt == prompt and len(prompt) > 1000
+    assert compose.call_args.kwargs["copy"] is None and result.copy == OverlayCopy()
+    if directed:
+        assert visual in prompt
+
+
+def test_use_brand_false_strips_context_but_preserves_independent_logo(monkeypatch, art_direction_response):
+    from app.social.ai import creative
+
+    brand = {
+        "brand_name": "Secret Brand", "industry": "Secret industry", "tagline": "Secret tagline",
+        "target_audience": "Secret audience", "tones": ["Secret tone"],
+        "words_to_use": ["Secret keyword"], "primary_color": "#0f766e", "accent_color": "#f59e0b",
+        "primary_language": "Secret language",
+    }
+    spec = CreativeSpec(use_brand=False, include_logo=True)
+    art_direct("Garden volunteers", spec, brand, None)
+    messages = art_direction_response.call_args.kwargs["messages"]
+    assert "Secret" not in str(messages) and "teal" not in str(messages)
+    prompt = build_visual_prompt("Garden volunteers", spec, brand, None)
+    assert "Secret" not in prompt and "teal" not in prompt and "orange" not in prompt
+    generate = Mock(return_value={"imageB64": _png()})
+    compose = Mock(return_value=b"composed")
+    monkeypatch.setattr(creative, "generate_post_image", generate)
+    monkeypatch.setattr(creative, "compose_creative", compose)
+    logo = _png((100, 100))
+    result = render_creative(topic="Garden volunteers", style=None, spec=spec, brand=brand, logo_bytes=logo)
+    assert result.logo_applied
+    assert compose.call_args.kwargs["logo_bytes"] == logo
+    assert compose.call_args.kwargs["primary_color"] is None
+    assert compose.call_args.kwargs["accent_color"] is None
+    assert "Secret" not in generate.call_args.kwargs["prompt_override"]
+
+
+@pytest.mark.parametrize("image_model", ["stability.sd3-5-large-v1:0", "stability.stable-image-ultra-v1:1", "stability.stable-image-core-v1:1"])
+def test_render_uses_context_selected_text_and_image_models(monkeypatch, image_model):
+    from app.providers.llm import bedrock_image, factory
+    from app.providers.llm.model_selection import ModelSelection, current_models, selected_models
+
+    text_model = "openai.gpt-oss-120b-1:0"
+    text_runtime = Mock()
+    text_runtime.converse.return_value = {"output": {"message": {"content": [{"text": json.dumps({
+        "visual": "A gardener tending seedlings in warm light.",
+    })}]}}}
+    image_runtime = Mock()
+    image_runtime.invoke_model.return_value = {"body": BytesIO(json.dumps({
+        "images": [base64.b64encode(_png()).decode()],
+    }).encode())}
+    monkeypatch.setattr(factory, "get_bedrock_runtime_client", lambda **kwargs: text_runtime)
+    monkeypatch.setattr(bedrock_image, "get_bedrock_runtime_client", lambda **kwargs: image_runtime)
+    monkeypatch.setattr(settings, "bedrock_aws_access_key_id", "test-key")
+    monkeypatch.setattr(settings, "bedrock_aws_secret_access_key", "test-secret")
+    monkeypatch.setattr(settings, "bedrock_model_id", "different-text-default")
+    monkeypatch.setattr(settings, "bedrock_image_model_id", "different-image-default")
+    before = current_models()
+    factory._get_llm_client.cache_clear()
+    try:
+        with selected_models(ModelSelection(text=text_model, image=image_model)):
+            result = render_creative(
+                topic="Garden volunteers", style=None,
+                spec=CreativeSpec(platform="instagram", caption="Plant herbs this Saturday"), brand={},
+            )
+        assert text_runtime.converse.call_args.kwargs["modelId"] == text_model
+        assert image_runtime.invoke_model.call_args.kwargs["modelId"] == image_model
+        assert Image.open(BytesIO(result.image)).size == (1080, 1350)
+        assert current_models() == before
+    finally:
+        factory._get_llm_client.cache_clear()
 
 
 class _FakeStorage:

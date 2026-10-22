@@ -8,25 +8,31 @@ from typing import Any
 
 from app.core.config import settings
 from app.providers.llm.bedrock_client import BedrockChatClient, get_bedrock_runtime_client
+from app.providers.llm.model_selection import current_models
 
 logger = logging.getLogger(__name__)
 
 
 def llm_configured() -> bool:
     return bool(
-        settings.bedrock_model_id
+        get_llm_model()
         and settings.resolved_bedrock_access_key_id
         and settings.resolved_bedrock_secret_access_key
     )
 
 
-@lru_cache(maxsize=1)
 def get_llm_client() -> BedrockChatClient:
     """Return a process-wide singleton client for chat completions."""
-    if not settings.bedrock_model_id:
+    model = get_llm_model()
+    if not model:
         raise RuntimeError("BEDROCK_MODEL_ID is not configured.")
-    runtime = get_bedrock_runtime_client()
-    return BedrockChatClient(runtime, settings.bedrock_model_id)
+    return _get_llm_client(model, settings.resolved_bedrock_region)
+
+
+@lru_cache(maxsize=16)
+def _get_llm_client(model: str, region: str) -> BedrockChatClient:
+    runtime = get_bedrock_runtime_client(region_name=region)
+    return BedrockChatClient(runtime, model)
 
 
 def get_image_client() -> BedrockChatClient:
@@ -40,7 +46,7 @@ def get_video_client() -> BedrockChatClient:
 
 def get_llm_model() -> str:
     """Return the configured Bedrock model ID."""
-    return settings.bedrock_model_id
+    return current_models().text or settings.bedrock_model_id
 
 
 def model_supports_custom_temperature(model: str | None = None) -> bool:
