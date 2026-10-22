@@ -52,6 +52,7 @@ class CreativeSpec:
     text_overlay: bool = False
     auto_copy: bool = True
     include_logo: bool = True
+    logo_id: Optional[str] = None
     logo_position: str = "top-right"
     use_brand: bool = True
     caption: str = ""

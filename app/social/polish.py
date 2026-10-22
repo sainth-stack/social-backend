@@ -28,7 +28,7 @@ from app.social.template_utils import (
     load_social_template_seed_rows,
     merge_placeholder_values,
 )
-from app.social.permissions import can_manage_team, get_user_permission, require_permission
+from app.social.permissions import _LEVEL_TO_PERMISSION, can_manage_team, require_permission
 from app.workspaces.models import SocialLevel
 
 _DASHBOARD_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="dashboard")
@@ -129,18 +129,35 @@ class SocialPolishService:
         memberships = list(
             self.db["workspace_members"].find({"workspace_id": workspace["id"]})
         )
+        if not memberships:
+            return []
+        users_by_id = {
+            user["id"]: user
+            for user in self.db["users"].find(
+                {"id": {"$in": [member["user_id"] for member in memberships]}}
+            )
+        }
+        first_membership_by_user = {}
+        for member in memberships:
+            first_membership_by_user.setdefault(member["user_id"], member)
         items = []
         for member in memberships:
-            user = self.db["users"].find_one({"id": member["user_id"]})
+            user = users_by_id.get(member["user_id"])
             if not user:
                 continue
-            permission = get_user_permission(self.db, workspace, user).value
+            if user.get("is_platform_admin") or workspace.get("owner_user_id") == user["id"]:
+                permission = SocialPermission.ADMIN
+            else:
+                level = first_membership_by_user[user["id"]].get(
+                    "social_level", SocialLevel.VIEWER.value
+                )
+                permission = _LEVEL_TO_PERMISSION.get(level, SocialPermission.VIEWER)
             items.append(
                 {
                     "userId": str(user["id"]),
                     "name": user.get("full_name") or user["email"],
                     "email": user["email"],
-                    "permission": permission,
+                    "permission": permission.value,
                 }
             )
         return items
@@ -935,7 +952,7 @@ class SocialPolishService:
             "blackoutDates": list(r.get("blackout_dates") or []),
             "defaultTone": r.get("default_tone") or "Professional",
             "defaultCta": r.get("default_cta") or "",
-            "hashtagCount": r.get("hashtag_count") or 5,
+            "hashtagCount": r.get("hashtag_count") if r.get("hashtag_count") is not None else 5,
             "autoFirstComment": bool(r.get("auto_first_comment")),
             "imageGenerationStyle": r.get("image_generation_style") or "Photographic",
             "openaiModel": r.get("openai_model") or settings.bedrock_model_id or "amazon.nova-micro-v1:0",

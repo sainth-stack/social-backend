@@ -233,6 +233,19 @@ class BrandVoiceUpdateRequest(BaseModel):
 
 class UploadLogoResponse(BaseModel):
     logoUrl: str
+    id: Optional[str] = None
+
+
+class BrandLogoOut(BaseModel):
+    id: str
+    url: str
+    name: str = ""
+    isDefault: bool = False
+    createdAt: Optional[str] = None
+
+
+class BrandLogoListResponse(BaseModel):
+    items: List[BrandLogoOut] = Field(default_factory=list)
 
 
 class GeneratePostRequest(BaseModel):
@@ -300,6 +313,7 @@ class GenerateImageRequest(BaseModel):
     textOverlay: bool = False
     autoCopy: bool = True
     includeLogo: bool = True
+    logoId: Optional[str] = Field(default=None, max_length=64)
     logoPosition: str = Field(default="top-right", pattern=r"^(top|bottom)-(left|right)$")
     useBrand: bool = True
     slideIndex: Optional[int] = Field(default=None, ge=1, le=20)

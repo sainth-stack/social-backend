@@ -13,7 +13,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 from fastapi import HTTPException, status
@@ -65,7 +65,7 @@ def blob_key_from_url(url: str) -> Optional[str]:
     try:
         parsed = urlparse(url)
         host = parsed.netloc.lower()
-        path = parsed.path.lstrip("/")
+        path = unquote(parsed.path.lstrip("/"))
         if not path or ".amazonaws.com" not in host:
             return None
         if host.startswith("s3.") or host.startswith("s3-"):
@@ -75,6 +75,18 @@ def blob_key_from_url(url: str) -> Optional[str]:
         return path
     except Exception:
         return None
+
+
+def relative_storage_key(url: Optional[str]) -> Optional[str]:
+    from app.core.config import settings
+
+    key = blob_key_from_url(url) if url else None
+    if not key:
+        return None
+    prefix = (settings.aws_storage_prefix or "").strip("/")
+    if prefix and key.startswith(f"{prefix}/"):
+        key = key[len(prefix) + 1:]
+    return key
 
 
 def _is_our_storage_url(url: str) -> bool:
@@ -163,19 +175,15 @@ def upload_workspace_logo_bytes(
         )
 
     mime = (content_type or "image/png").split(";")[0].strip().lower()
-    if not mime.startswith("image/"):
+    if mime not in ("image/png", "image/jpeg", "image/jpg", "image/webp"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Logo must be an image file (PNG, JPG, SVG, or WebP)",
+            detail="Logo must be a PNG, JPG, or WebP image",
         )
 
-    ext = _MIME_TO_EXT.get(mime)
-    if not ext and filename_hint and "." in filename_hint:
-        ext = filename_hint.rsplit(".", 1)[-1].lower()[:8]
-    if not ext:
-        ext = "png"
+    ext = _MIME_TO_EXT.get(mime) or "png"
 
-    key = f"logos/{workspace_id}/logo.{ext}"
+    key = f"logos/{workspace_id}/{uuid.uuid4().hex}.{ext}"
     storage = get_storage_provider()
     storage.upload_bytes(key, data, content_type=mime)
     url = _public_url_for_key(key)

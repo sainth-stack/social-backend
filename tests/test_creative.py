@@ -47,17 +47,22 @@ def test_target_and_generation_sizes():
 
 
 class _FakeStorage:
-    def __init__(self):
+    def __init__(self, prefix: str = ""):
         self.objects: dict[str, bytes] = {}
+        self.prefix = prefix
 
     def upload_bytes(self, key, data, content_type=None):
         self.objects[key] = data
 
     def presigned_get_url(self, key, expires_in=0):
-        return f"https://bucket.s3.amazonaws.com/{key}"
+        full = f"{self.prefix}/{key}" if self.prefix else key
+        return f"https://bucket.s3.ap-south-1.amazonaws.com/{full}?X-Amz-Signature=abc"
 
     def download_bytes(self, key, bucket=None):
         return self.objects[key]
+
+    def delete_object(self, key, bucket=None):
+        self.objects.pop(key, None)
 
 
 @pytest.fixture()
@@ -127,5 +132,62 @@ def test_generate_image_creative_with_brand(client, db, monkeypatch, fake_storag
     assert out["headline"]
     assert "Fintech" in captured["prompt_override"]
     assert captured["size"] == "1024x1280"
-    key = out["imageUrl"].split(".com/", 1)[1]
+    key = out["imageUrl"].split(".com/", 1)[1].split("?", 1)[0]
     assert Image.open(BytesIO(fake_storage.objects[key])).size == (1080, 1350)
+
+
+def test_logo_library_with_storage_prefix(client, db, monkeypatch, fake_storage):
+    import app.social.ai.creative as creative
+
+    fake_storage.prefix = "peers"
+    monkeypatch.setattr(settings, "aws_storage_prefix", "peers")
+    monkeypatch.setattr(
+        creative,
+        "generate_post_image",
+        lambda **kwargs: {"imageB64": _png((1024, 1280)), "source": "ai_generated"},
+    )
+    monkeypatch.setattr(creative, "art_direct", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("off")))
+    monkeypatch.setattr("app.social.limits.enforce_ai_image_limit", lambda db, ws: None)
+
+    body = client.post(
+        f"{API}/auth/register",
+        json={"email": "logos@example.com", "password": "s3cret-pass"},
+    ).json()
+    headers = {"Authorization": f"Bearer {body['access_token']}"}
+    base = f"{API}/workspaces/{body['workspace']['id']}/social"
+
+    first = client.post(
+        f"{base}/upload-logo",
+        headers=headers,
+        files={"file": ("primary.png", _png((300, 100), (0, 0, 0, 255), "RGBA"), "image/png")},
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        f"{base}/upload-logo?setDefault=false",
+        headers=headers,
+        files={"file": ("mono.png", _png((200, 200), (255, 255, 255, 255), "RGBA"), "image/png")},
+    )
+    assert second.status_code == 200, second.text
+    svg = client.post(
+        f"{base}/upload-logo",
+        headers=headers,
+        files={"file": ("logo.svg", b"<svg/>", "image/svg+xml")},
+    )
+    assert svg.status_code == 400
+
+    logos = client.get(f"{base}/brand-logos", headers=headers).json()["items"]
+    assert [l["name"] for l in logos] == ["mono.png", "primary.png"]
+    assert [l["isDefault"] for l in logos] == [False, True]
+
+    for logo_id in (None, second.json()["id"]):
+        res = client.post(
+            f"{base}/generate-image",
+            headers=headers,
+            json={"topic": "Weekend flash sale on all plans", "format": "post", "logoId": logo_id},
+        )
+        assert res.status_code == 200, res.text
+        assert res.json()["logoApplied"] is True
+
+    after = client.delete(f"{base}/brand-logos/{first.json()['id']}", headers=headers).json()["items"]
+    assert len(after) == 1 and after[0]["isDefault"] is True
+    assert client.get(f"{base}/brand-voice", headers=headers).json()["logoUrl"]

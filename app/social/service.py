@@ -38,8 +38,11 @@ PUBLISHABLE_PLATFORMS = {
 }
 from app.social.oauth.base import OAuthAccountProfile, generate_state_token, get_oauth_handler
 from app.social.schemas import (
+    BrandLogoListResponse,
+    BrandLogoOut,
     BrandVoiceOut,
     BrandVoiceTestResponse,
+    UploadLogoResponse,
     BrandVoiceUpdateRequest,
     CalendarPostOut,
     CalendarResponse,
@@ -1194,18 +1197,104 @@ class SocialMediaService:
         record_ai_usage(self.db, workspace["id"], "text")
         return BrandVoiceTestResponse(**sample)
 
-    def upload_logo(self, workspace: dict, *, data: bytes, content_type: str, filename: Optional[str] = None) -> str:
+    def upload_logo(
+        self,
+        workspace: dict,
+        *,
+        data: bytes,
+        content_type: str,
+        filename: Optional[str] = None,
+        set_default: bool = True,
+    ) -> UploadLogoResponse:
         from app.social.media import upload_workspace_logo_bytes
 
         upload = upload_workspace_logo_bytes(
             workspace["id"], data, content_type=content_type, filename_hint=filename
         )
+        self._sync_legacy_logo(workspace["id"])
+        entry = {
+            "id": new_id(),
+            "key": upload.blob_key,
+            "name": (filename or "Logo")[:120],
+            "created_at": utcnow(),
+        }
+        updates: dict = {"updated_at": utcnow()}
+        if set_default:
+            updates["logo_url"] = upload.url
         self.db["social_brand_voices"].update_one(
             {"workspace_id": workspace["id"]},
-            {"$set": {"logo_url": upload.url, "updated_at": utcnow()}, "$setOnInsert": {"id": new_id()}},
+            {"$set": updates, "$push": {"logos": entry}, "$setOnInsert": {"id": new_id()}},
             upsert=True,
         )
-        return upload.url
+        return UploadLogoResponse(logoUrl=upload.url, id=entry["id"])
+
+    def _sync_legacy_logo(self, workspace_id: str) -> Optional[dict]:
+        from app.social.media import relative_storage_key
+
+        row = self._get_brand_voice_row(workspace_id)
+        if not row:
+            return None
+        logos = list(row.get("logos") or [])
+        key = relative_storage_key(row.get("logo_url"))
+        if key and key.startswith(f"logos/{workspace_id}/") and all(l.get("key") != key for l in logos):
+            entry = {"id": new_id(), "key": key, "name": "Logo", "created_at": row.get("updated_at") or utcnow()}
+            self.db["social_brand_voices"].update_one({"_id": row["_id"]}, {"$push": {"logos": entry}})
+            logos.append(entry)
+            row["logos"] = logos
+        return row
+
+    def list_logos(self, workspace: dict) -> BrandLogoListResponse:
+        from app.social.media import refresh_blob_url, relative_storage_key
+
+        row = self._sync_legacy_logo(workspace["id"])
+        if not row:
+            return BrandLogoListResponse()
+        default_key = relative_storage_key(row.get("logo_url"))
+        items = [
+            BrandLogoOut(
+                id=str(l["id"]),
+                url=refresh_blob_url(l["key"]),
+                name=l.get("name") or "Logo",
+                isDefault=l.get("key") == default_key,
+                createdAt=_iso(l.get("created_at")),
+            )
+            for l in reversed(row.get("logos") or [])
+            if l.get("key")
+        ]
+        return BrandLogoListResponse(items=items)
+
+    def _find_logo(self, workspace_id: str, logo_id: str) -> tuple[dict, dict]:
+        row = self._sync_legacy_logo(workspace_id)
+        logo = next((l for l in (row or {}).get("logos") or [] if str(l.get("id")) == logo_id), None)
+        if not row or not logo:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Logo not found")
+        return row, logo
+
+    def set_default_logo(self, workspace: dict, logo_id: str) -> BrandLogoListResponse:
+        from app.social.media import refresh_blob_url
+
+        row, logo = self._find_logo(workspace["id"], logo_id)
+        self.db["social_brand_voices"].update_one(
+            {"_id": row["_id"]},
+            {"$set": {"logo_url": refresh_blob_url(logo["key"]), "updated_at": utcnow()}},
+        )
+        return self.list_logos(workspace)
+
+    def delete_logo(self, workspace: dict, logo_id: str) -> BrandLogoListResponse:
+        from app.providers.storage.factory import get_storage_provider
+        from app.social.media import refresh_blob_url, relative_storage_key
+
+        row, logo = self._find_logo(workspace["id"], logo_id)
+        remaining = [l for l in row.get("logos") or [] if l.get("id") != logo.get("id")]
+        updates: dict = {"logos": remaining, "updated_at": utcnow()}
+        if relative_storage_key(row.get("logo_url")) == logo["key"]:
+            updates["logo_url"] = refresh_blob_url(remaining[-1]["key"]) if remaining else None
+        self.db["social_brand_voices"].update_one({"_id": row["_id"]}, {"$set": updates})
+        try:
+            get_storage_provider().delete_object(logo["key"])
+        except Exception as exc:
+            logger.warning("Logo delete failed for workspace %s: %s", workspace["id"], exc)
+        return self.list_logos(workspace)
 
     def generate_post(self, workspace: dict, payload: GeneratePostRequest, user: Optional[dict] = None) -> GeneratePostResponse:
         from app.social.limits import enforce_ai_text_limit
@@ -1358,32 +1447,31 @@ class SocialMediaService:
         if params.search and params.search.strip():
             query["prompt"] = {"$regex": re.escape(params.search.strip()), "$options": "i"}
 
-        total = self.db["social_media_assets"].count_documents(query)
         page_size = params.pageSize
         page = params.page
+        result = next(iter(self.db["social_media_assets"].aggregate([
+            {"$match": {"workspace_id": workspace["id"], "is_deleted": False}},
+            {"$facet": {
+                "items": [
+                    {"$match": query},
+                    {"$sort": {"created_at": -1, "id": -1}},
+                    {"$skip": (page - 1) * page_size},
+                    {"$limit": page_size},
+                ],
+                "total": [{"$match": query}, {"$count": "count"}],
+                "stats": [{"$group": {
+                    "_id": "$media_type",
+                    "count": {"$sum": 1},
+                    "bytes": {"$sum": "$file_size_bytes"},
+                }}],
+            }},
+        ])), {})
+        total = result.get("total", [{}])[0].get("count", 0) if result.get("total") else 0
         total_pages = max(1, math.ceil(total / page_size)) if total else 0
-
-        rows = list(
-            self.db["social_media_assets"]
-            .find(query)
-            .sort("created_at", -1)
-            .skip((page - 1) * page_size)
-            .limit(page_size)
-        )
+        rows = result.get("items", [])
 
         stats = MediaAssetStats()
-        for row in self.db["social_media_assets"].aggregate(
-            [
-                {"$match": {"workspace_id": workspace["id"], "is_deleted": False}},
-                {
-                    "$group": {
-                        "_id": "$media_type",
-                        "count": {"$sum": 1},
-                        "bytes": {"$sum": "$file_size_bytes"},
-                    }
-                },
-            ]
-        ):
+        for row in result.get("stats", []):
             if row["_id"] == "image":
                 stats.images = int(row["count"])
             elif row["_id"] == "video":
@@ -1638,12 +1726,13 @@ class SocialMediaService:
             "accent_color": row.get("accent_color"),
         }
 
-    def _load_logo_bytes(self, workspace_id: str, logo_url: Optional[str]) -> Optional[bytes]:
+    def _load_logo_bytes(self, workspace_id: str, logo_url: Optional[str] = None, key: Optional[str] = None) -> Optional[bytes]:
         from app.providers.storage.factory import get_storage_provider
-        from app.social.media import blob_key_from_url
+        from app.social.media import relative_storage_key
 
-        key = blob_key_from_url(logo_url) if logo_url else None
+        key = key or relative_storage_key(logo_url)
         if not key or not key.startswith(f"logos/{workspace_id}/"):
+            logger.info("Logo skipped for workspace %s: not a workspace logo object", workspace_id)
             return None
         try:
             return get_storage_provider().download_bytes(key)
@@ -1660,12 +1749,17 @@ class SocialMediaService:
     ) -> "CreativeResult":
         from app.social.ai.creative import render_creative
 
-        brand = self._brand_voice_dict(workspace["id"]) if spec.use_brand else {}
-        logo_bytes = (
-            self._load_logo_bytes(workspace["id"], brand.get("logo_url"))
-            if spec.include_logo and brand.get("logo_url")
-            else None
-        )
+        ws_id = workspace["id"]
+        brand = self._brand_voice_dict(ws_id) if spec.use_brand else {}
+        logo_bytes: Optional[bytes] = None
+        if spec.include_logo:
+            if spec.logo_id:
+                _, logo = self._find_logo(ws_id, spec.logo_id)
+                logo_bytes = self._load_logo_bytes(ws_id, key=logo["key"])
+            else:
+                row = self._get_brand_voice_row(ws_id) or {}
+                if row.get("logo_url"):
+                    logo_bytes = self._load_logo_bytes(ws_id, row.get("logo_url"))
         try:
             return render_creative(topic=topic, style=style, spec=spec, brand=brand, logo_bytes=logo_bytes)
         except RuntimeError as exc:
@@ -1685,9 +1779,9 @@ class SocialMediaService:
             wordsToUse=list(row.get("words_to_use") or []),
             wordsToAvoid=list(row.get("words_to_avoid") or []),
             ctaPhrases=list(row.get("cta_phrases") or []),
-            sentenceLength=row.get("sentence_length"),
-            emojiUsage=row.get("emoji_usage"),
-            primaryLanguage=row.get("primary_language", "en"),
+            sentenceLength=row.get("sentence_length") or "medium",
+            emojiUsage=row.get("emoji_usage") or "sometimes",
+            primaryLanguage=row.get("primary_language") or "en",
             systemPromptOverride=row.get("system_prompt_override"),
             logoUrl=resolve_stored_image_url(row.get("logo_url")),
             primaryColor=row.get("primary_color"),

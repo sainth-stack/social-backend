@@ -125,3 +125,49 @@ def test_media_delete_and_missing(client, db, fake_presign):
     assert client.delete(url, headers=headers).status_code == 204
     assert client.delete(url, headers=headers).status_code == 404
     assert client.get(url, headers=headers).status_code == 404
+
+
+def test_media_pagination_uses_one_aggregation(client, db, fake_presign, monkeypatch):
+    ws, headers = _setup(client)
+    for index in range(5):
+        _asset(db, ws, "image", 100, prompt=f"Image {index}")
+    _asset(db, "another-workspace", "video", 9000)
+    collection = db["social_media_assets"]
+    aggregate = collection.aggregate
+    calls = []
+
+    def tracked(pipeline, *args, **kwargs):
+        calls.append(pipeline)
+        return aggregate(pipeline, *args, **kwargs)
+
+    monkeypatch.setattr(collection, "aggregate", tracked)
+    url = f"{API}/workspaces/{ws}/social/media-assets"
+    first = client.get(url, headers=headers, params={"page": 1, "pageSize": 2}).json()
+    assert len(calls) == 1
+    assert first["total"] == 5
+    assert first["totalPages"] == 3
+    assert len(first["items"]) == 2
+    assert first["stats"] == {"images": 5, "videos": 0, "totalBytes": 500}
+    second = client.get(url, headers=headers, params={"page": 2, "pageSize": 2}).json()
+    assert not {item["id"] for item in first["items"]} & {item["id"] for item in second["items"]}
+    last = client.get(url, headers=headers, params={"page": 3, "pageSize": 2}).json()
+    assert len(last["items"]) == 1
+
+
+def test_media_empty_filter_preserves_workspace_stats(client, db, fake_presign):
+    ws, headers = _setup(client)
+    _asset(db, ws, "image", 120)
+    url = f"{API}/workspaces/{ws}/social/media-assets"
+    body = client.get(url, headers=headers, params={"source": "ai_generated"}).json()
+    assert body["items"] == []
+    assert body["total"] == 0
+    assert body["totalPages"] == 0
+    assert body["stats"] == {"images": 1, "videos": 0, "totalBytes": 120}
+
+
+def test_media_empty_workspace(client, db, fake_presign):
+    ws, headers = _setup(client)
+    response = client.get(f"{API}/workspaces/{ws}/social/media-assets", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["stats"] == {"images": 0, "videos": 0, "totalBytes": 0}
+    assert response.json()["items"] == []

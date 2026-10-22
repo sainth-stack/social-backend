@@ -34,6 +34,7 @@ from app.social.schemas import (
     ApplyTemplateRequest,
     ApplyTemplateResponse,
     AudienceGrowthOut,
+    BrandLogoListResponse,
     BrandVoiceOut,
     BrandVoiceTestResponse,
     BrandVoiceUpdateRequest,
@@ -663,6 +664,7 @@ def generate_image(
             text_overlay=payload.textOverlay,
             auto_copy=payload.autoCopy,
             include_logo=payload.includeLogo,
+            logo_id=payload.logoId or None,
             logo_position=payload.logoPosition,
             use_brand=payload.useBrand,
             caption=payload.caption or "",
@@ -687,17 +689,47 @@ async def upload_logo(
     db: Database = Depends(get_db),
     _: dict = Depends(get_current_user),
     file: UploadFile = File(...),
+    setDefault: bool = Query(default=True),
 ) -> UploadLogoResponse:
-    """Upload workspace logo to S3; persists on brand voice profile."""
+    """Upload a workspace logo to S3 and add it to the brand logo library."""
     data = await file.read()
-    logo_url = await run_in_threadpool(
+    return await run_in_threadpool(
         SocialMediaService(db).upload_logo,
         workspace,
         data=data,
         content_type=file.content_type or "image/png",
         filename=file.filename,
+        set_default=setDefault,
     )
-    return UploadLogoResponse(logoUrl=logo_url)
+
+
+@router.get("/brand-logos", response_model=BrandLogoListResponse)
+def list_brand_logos(
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
+) -> BrandLogoListResponse:
+    return SocialMediaService(db).list_logos(workspace)
+
+
+@router.post("/brand-logos/{logo_id}/default", response_model=BrandLogoListResponse)
+def set_default_brand_logo(
+    logo_id: str,
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
+) -> BrandLogoListResponse:
+    return SocialMediaService(db).set_default_logo(workspace, logo_id)
+
+
+@router.delete("/brand-logos/{logo_id}", response_model=BrandLogoListResponse)
+def delete_brand_logo(
+    logo_id: str,
+    workspace: dict = Depends(require_workspace_access),
+    db: Database = Depends(get_db),
+    _: dict = Depends(get_current_user),
+) -> BrandLogoListResponse:
+    return SocialMediaService(db).delete_logo(workspace, logo_id)
 
 
 @router.post("/upload-image", response_model=GenerateImageResponse)
